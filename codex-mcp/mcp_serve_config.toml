@@ -1,0 +1,24 @@
+# Example configuration that mcp_serve.cmd points to when launching
+# `codex mcp serve`. Copy or tweak the values below to adjust how the
+# embedded Codex session behaves while it is acting as an MCP server.
+
+# Keep the sandbox permissive enough for local edits while still blocking
+# writes outside the current workspace.
+sandbox_mode = "workspace-write"
+
+# Pick a default profile (optional). This example switches to a profile named
+# "mcp-server" so you can keep server-specific overrides isolated.
+profile = "mcp-server"
+
+[profiles.mcp-server]
+# Prefer a fast, reasoning-capable model when brokering requests from MCP
+# clients. Change the model name to whatever you have access to.
+model = "gpt-4.1-mini"
+
+# Lower the default approval friction so the server can answer tooling
+# questions without interactive escalation. Adjust to match your risk profile.
+approval_policy = "auto"
+
+[tools]
+# Disable web search when serving via MCP to avoid unexpected network IO.
+web_search = false

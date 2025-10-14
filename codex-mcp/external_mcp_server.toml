@@ -1,0 +1,23 @@
+# Example snippet to add an external MCP server to Codex. Drop this into
+# `~/.codex/config.toml` (or merge with your existing config) so Codex can
+# discover third-party tools exposed by the external process.
+
+[mcp_servers.docs]
+# `command` points to the bootstrapper that launches the MCP server over stdio.
+command = "docs-mcp"
+# Any extra CLI flags the server expects go into `args`.
+args = ["--workspace", "${WORKSPACE_ROOT}"]
+
+# Optional launch-time environment variables, sorted for readability.
+[mcp_servers.docs.env]
+API_BASE = "https://internal.example/api"
+API_TOKEN = "replace-me-with-a-real-token"
+
+# Uncomment the section below if the external server is reachable over HTTPS
+# instead of stdio. You should remove the stdio settings above when doing so.
+#
+# [mcp_servers.remote_docs]
+# url = "https://docs-mcp.example.com"
+# bearer_token = "replace-me-with-a-real-bearer-token"
+# startup_timeout_sec = 5.0
+# tool_timeout_sec = 60.0
