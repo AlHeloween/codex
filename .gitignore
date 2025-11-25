@@ -81,3 +81,5 @@ CHANGELOG.ignore.md
 # nix related
 .direnv
 .envrc
+codex-rs/Cargo.lock
+codex-rs/Cargo.toml
