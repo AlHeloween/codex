@@ -1,3 +1,4 @@
+use crate::key_hint::has_ctrl_or_alt;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
@@ -35,6 +36,9 @@ use crate::bottom_pane::prompt_args::parse_slash_name;
 use crate::bottom_pane::prompt_args::prompt_argument_names;
 use crate::bottom_pane::prompt_args::prompt_command_with_arg_placeholders;
 use crate::bottom_pane::prompt_args::prompt_has_numeric_placeholders;
+use crate::render::Insets;
+use crate::render::RectExt;
+use crate::render::renderable::Renderable;
 use crate::slash_command::SlashCommand;
 use crate::slash_command::built_in_slash_commands;
 use crate::style::user_message_style;
@@ -108,7 +112,7 @@ pub(crate) struct ChatComposer {
     custom_prompts: Vec<CustomPrompt>,
     footer_mode: FooterMode,
     footer_hint_override: Option<Vec<(String, String)>>,
-    context_window_percent: Option<u8>,
+    context_window_percent: Option<i64>,
 }
 
 /// Popup state – at most one can be visible at any time.
@@ -158,23 +162,6 @@ impl ChatComposer {
         this
     }
 
-    pub fn desired_height(&self, width: u16) -> u16 {
-        let footer_props = self.footer_props();
-        let footer_hint_height = self
-            .custom_footer_height()
-            .unwrap_or_else(|| footer_height(footer_props));
-        let footer_spacing = Self::footer_spacing(footer_hint_height);
-        let footer_total_height = footer_hint_height + footer_spacing;
-        self.textarea
-            .desired_height(width.saturating_sub(LIVE_PREFIX_COLS))
-            + 2
-            + match &self.active_popup {
-                ActivePopup::None => footer_total_height,
-                ActivePopup::Command(c) => c.calculate_required_height(width),
-                ActivePopup::File(c) => c.calculate_required_height(),
-            }
-    }
-
     fn layout_areas(&self, area: Rect) -> [Rect; 3] {
         let footer_props = self.footer_props();
         let footer_hint_height = self
@@ -189,16 +176,9 @@ impl ChatComposer {
             ActivePopup::File(popup) => Constraint::Max(popup.calculate_required_height()),
             ActivePopup::None => Constraint::Max(footer_total_height),
         };
-        let mut area = area;
-        if area.height > 1 {
-            area.height -= 1;
-            area.y += 1;
-        }
         let [composer_rect, popup_rect] =
-            Layout::vertical([Constraint::Min(1), popup_constraint]).areas(area);
-        let mut textarea_rect = composer_rect;
-        textarea_rect.width = textarea_rect.width.saturating_sub(LIVE_PREFIX_COLS);
-        textarea_rect.x = textarea_rect.x.saturating_add(LIVE_PREFIX_COLS);
+            Layout::vertical([Constraint::Min(3), popup_constraint]).areas(area);
+        let textarea_rect = composer_rect.inset(Insets::tlbr(1, LIVE_PREFIX_COLS, 1, 1));
         [composer_rect, textarea_rect, popup_rect]
     }
 
@@ -208,12 +188,6 @@ impl ChatComposer {
         } else {
             FOOTER_SPACING_HEIGHT
         }
-    }
-
-    pub fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {
-        let [_, textarea_rect, _] = self.layout_areas(area);
-        let state = *self.textarea_state.borrow();
-        self.textarea.cursor_pos_with_state(textarea_rect, state)
     }
 
     /// Returns true if the composer currently contains no user input.
@@ -239,8 +213,7 @@ impl ChatComposer {
         let Some(text) = self.history.on_entry_response(log_id, offset, entry) else {
             return false;
         };
-        self.textarea.set_text(&text);
-        self.textarea.set_cursor(0);
+        self.set_text_content(text);
         true
     }
 
@@ -281,7 +254,7 @@ impl ChatComposer {
                 true
             }
             Err(err) => {
-                tracing::info!("ERR: {err}");
+                tracing::trace!("ERR: {err}");
                 false
             }
         }
@@ -311,6 +284,17 @@ impl ChatComposer {
         self.textarea.set_cursor(0);
         self.sync_command_popup();
         self.sync_file_search_popup();
+    }
+
+    pub(crate) fn clear_for_ctrl_c(&mut self) -> Option<String> {
+        if self.is_empty() {
+            return None;
+        }
+        let previous = self.current_text();
+        self.set_text_content(String::new());
+        self.history.reset_navigation();
+        self.history.record_local_submission(&previous);
+        Some(previous)
     }
 
     /// Get the current composer text.
@@ -427,12 +411,22 @@ impl ChatComposer {
         match key_event {
             KeyEvent {
                 code: KeyCode::Up, ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('p'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
             } => {
                 popup.move_up();
                 (InputResult::None, true)
             }
             KeyEvent {
                 code: KeyCode::Down,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('n'),
+                modifiers: KeyModifiers::CONTROL,
                 ..
             } => {
                 popup.move_down();
@@ -560,6 +554,16 @@ impl ChatComposer {
 
     #[inline]
     fn handle_non_ascii_char(&mut self, input: KeyEvent) -> (InputResult, bool) {
+        if let KeyEvent {
+            code: KeyCode::Char(ch),
+            ..
+        } = input
+        {
+            let now = Instant::now();
+            if self.paste_burst.try_append_char_if_active(ch, now) {
+                return (InputResult::None, true);
+            }
+        }
         if let Some(pasted) = self.paste_burst.flush_before_modified_input() {
             self.handle_paste(pasted);
         }
@@ -591,12 +595,22 @@ impl ChatComposer {
         match key_event {
             KeyEvent {
                 code: KeyCode::Up, ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('p'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
             } => {
                 popup.move_up();
                 (InputResult::None, true)
             }
             KeyEvent {
                 code: KeyCode::Down,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('n'),
+                modifiers: KeyModifiers::CONTROL,
                 ..
             } => {
                 popup.move_down();
@@ -849,10 +863,12 @@ impl ChatComposer {
             return (InputResult::None, true);
         }
         if key_event.code == KeyCode::Esc {
-            let next_mode = esc_hint_mode(self.footer_mode, self.is_task_running);
-            if next_mode != self.footer_mode {
-                self.footer_mode = next_mode;
-                return (InputResult::None, true);
+            if self.is_empty() {
+                let next_mode = esc_hint_mode(self.footer_mode, self.is_task_running);
+                if next_mode != self.footer_mode {
+                    self.footer_mode = next_mode;
+                    return (InputResult::None, true);
+                }
             }
         } else {
             self.footer_mode = reset_mode_after_activity(self.footer_mode);
@@ -875,6 +891,11 @@ impl ChatComposer {
             KeyEvent {
                 code: KeyCode::Up | KeyCode::Down,
                 ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('p') | KeyCode::Char('n'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
             } => {
                 if self
                     .history
@@ -883,11 +904,12 @@ impl ChatComposer {
                     let replace_text = match key_event.code {
                         KeyCode::Up => self.history.navigate_up(&self.app_event_tx),
                         KeyCode::Down => self.history.navigate_down(&self.app_event_tx),
+                        KeyCode::Char('p') => self.history.navigate_up(&self.app_event_tx),
+                        KeyCode::Char('n') => self.history.navigate_down(&self.app_event_tx),
                         _ => unreachable!(),
                     };
                     if let Some(text) = replace_text {
-                        self.textarea.set_text(&text);
-                        self.textarea.set_cursor(0);
+                        self.set_text_content(text);
                         return (InputResult::None, true);
                     }
                 }
@@ -932,21 +954,17 @@ impl ChatComposer {
                         return (InputResult::None, true);
                     }
                 }
-                // If we have pending placeholder pastes, submit immediately to expand them.
+                // If we have pending placeholder pastes, replace them in the textarea text
+                // and continue to the normal submission flow to handle slash commands.
                 if !self.pending_pastes.is_empty() {
                     let mut text = self.textarea.text().to_string();
-                    self.textarea.set_text("");
                     for (placeholder, actual) in &self.pending_pastes {
                         if text.contains(placeholder) {
                             text = text.replace(placeholder, actual);
                         }
                     }
+                    self.textarea.set_text(&text);
                     self.pending_pastes.clear();
-                    if text.is_empty() {
-                        return (InputResult::None, true);
-                    }
-                    self.history.record_local_submission(&text);
-                    return (InputResult::Submitted(text), true);
                 }
 
                 // During a paste-like burst, treat Enter as a newline instead of submit.
@@ -962,6 +980,7 @@ impl ChatComposer {
                 }
                 let mut text = self.textarea.text().to_string();
                 let original_input = text.clone();
+                let input_starts_with_space = original_input.starts_with(' ');
                 self.textarea.set_text("");
 
                 // Replace all pending pastes in the text
@@ -975,6 +994,35 @@ impl ChatComposer {
                 // If there is neither text nor attachments, suppress submission entirely.
                 let has_attachments = !self.attached_images.is_empty();
                 text = text.trim().to_string();
+                if let Some((name, _rest)) = parse_slash_name(&text) {
+                    let treat_as_plain_text = input_starts_with_space || name.contains('/');
+                    if !treat_as_plain_text {
+                        let is_builtin = built_in_slash_commands()
+                            .into_iter()
+                            .any(|(command_name, _)| command_name == name);
+                        let prompt_prefix = format!("{PROMPTS_CMD_PREFIX}:");
+                        let is_known_prompt = name
+                            .strip_prefix(&prompt_prefix)
+                            .map(|prompt_name| {
+                                self.custom_prompts
+                                    .iter()
+                                    .any(|prompt| prompt.name == prompt_name)
+                            })
+                            .unwrap_or(false);
+                        if !is_builtin && !is_known_prompt {
+                            let message = format!(
+                                r#"Unrecognized command '/{name}'. Type "/" for a list of supported commands."#
+                            );
+                            self.app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
+                                history_cell::new_info_event(message, None),
+                            )));
+                            self.textarea.set_text(&original_input);
+                            self.textarea.set_cursor(original_input.len());
+                            return (InputResult::None, true);
+                        }
+                    }
+                }
+
                 let expanded_prompt = match expand_custom_prompt(&text, &self.custom_prompts) {
                     Ok(expanded) => expanded,
                     Err(err) => {
@@ -1052,8 +1100,7 @@ impl ChatComposer {
             ..
         } = input
         {
-            let has_ctrl_or_alt =
-                modifiers.contains(KeyModifiers::CONTROL) || modifiers.contains(KeyModifiers::ALT);
+            let has_ctrl_or_alt = has_ctrl_or_alt(modifiers);
             if !has_ctrl_or_alt {
                 // Non-ASCII characters (e.g., from IMEs) can arrive in quick bursts and be
                 // misclassified by paste heuristics. Flush any active burst buffer and insert
@@ -1123,8 +1170,7 @@ impl ChatComposer {
         } = input;
         match code {
             KeyCode::Char(_) => {
-                let has_ctrl_or_alt = modifiers.contains(KeyModifiers::CONTROL)
-                    || modifiers.contains(KeyModifiers::ALT);
+                let has_ctrl_or_alt = has_ctrl_or_alt(modifiers);
                 if has_ctrl_or_alt {
                     self.paste_burst.clear_window_after_non_char();
                 }
@@ -1471,7 +1517,7 @@ impl ChatComposer {
         self.is_task_running = running;
     }
 
-    pub(crate) fn set_context_window_percent(&mut self, percent: Option<u8>) {
+    pub(crate) fn set_context_window_percent(&mut self, percent: Option<i64>) {
         if self.context_window_percent != percent {
             self.context_window_percent = percent;
         }
@@ -1487,8 +1533,32 @@ impl ChatComposer {
     }
 }
 
-impl WidgetRef for ChatComposer {
-    fn render_ref(&self, area: Rect, buf: &mut Buffer) {
+impl Renderable for ChatComposer {
+    fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {
+        let [_, textarea_rect, _] = self.layout_areas(area);
+        let state = *self.textarea_state.borrow();
+        self.textarea.cursor_pos_with_state(textarea_rect, state)
+    }
+
+    fn desired_height(&self, width: u16) -> u16 {
+        let footer_props = self.footer_props();
+        let footer_hint_height = self
+            .custom_footer_height()
+            .unwrap_or_else(|| footer_height(footer_props));
+        let footer_spacing = Self::footer_spacing(footer_hint_height);
+        let footer_total_height = footer_hint_height + footer_spacing;
+        const COLS_WITH_MARGIN: u16 = LIVE_PREFIX_COLS + 1;
+        self.textarea
+            .desired_height(width.saturating_sub(COLS_WITH_MARGIN))
+            + 2
+            + match &self.active_popup {
+                ActivePopup::None => footer_total_height,
+                ActivePopup::Command(c) => c.calculate_required_height(width),
+                ActivePopup::File(c) => c.calculate_required_height(),
+            }
+    }
+
+    fn render(&self, area: Rect, buf: &mut Buffer) {
         let [composer_rect, textarea_rect, popup_rect] = self.layout_areas(area);
         match &self.active_popup {
             ActivePopup::Command(popup) => {
@@ -1537,16 +1607,15 @@ impl WidgetRef for ChatComposer {
             }
         }
         let style = user_message_style();
-        let mut block_rect = composer_rect;
-        block_rect.y = composer_rect.y.saturating_sub(1);
-        block_rect.height = composer_rect.height.saturating_add(1);
-        Block::default().style(style).render_ref(block_rect, buf);
-        buf.set_span(
-            composer_rect.x,
-            composer_rect.y,
-            &"›".bold(),
-            composer_rect.width,
-        );
+        Block::default().style(style).render_ref(composer_rect, buf);
+        if !textarea_rect.is_empty() {
+            buf.set_span(
+                textarea_rect.x - LIVE_PREFIX_COLS,
+                textarea_rect.y,
+                &"›".bold(),
+                textarea_rect.width,
+            );
+        }
 
         let mut state = self.textarea_state.borrow_mut();
         StatefulWidgetRef::render_ref(&(&self.textarea), textarea_rect, buf, &mut state);
@@ -1638,7 +1707,7 @@ mod tests {
 
         let area = Rect::new(0, 0, 40, 6);
         let mut buf = Buffer::empty(area);
-        composer.render_ref(area, &mut buf);
+        composer.render(area, &mut buf);
 
         let row_to_string = |y: u16| {
             let mut row = String::new();
@@ -1702,7 +1771,7 @@ mod tests {
         let height = footer_lines + footer_spacing + 8;
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
-            .draw(|f| f.render_widget_ref(composer, f.area()))
+            .draw(|f| composer.render(f.area(), f.buffer_mut()))
             .unwrap();
         insta::assert_snapshot!(name, terminal.backend());
     }
@@ -1757,6 +1826,57 @@ mod tests {
         snapshot_composer_state("footer_mode_hidden_while_typing", true, |composer| {
             type_chars_humanlike(composer, &['h']);
         });
+    }
+
+    #[test]
+    fn esc_hint_stays_hidden_with_draft_content() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            true,
+            sender,
+            true,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+
+        type_chars_humanlike(&mut composer, &['d']);
+
+        assert!(!composer.is_empty());
+        assert_eq!(composer.current_text(), "d");
+        assert_eq!(composer.footer_mode, FooterMode::ShortcutSummary);
+        assert!(matches!(composer.active_popup, ActivePopup::None));
+
+        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert_eq!(composer.footer_mode, FooterMode::ShortcutSummary);
+        assert!(!composer.esc_backtrack_hint);
+    }
+
+    #[test]
+    fn clear_for_ctrl_c_records_cleared_draft() {
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            true,
+            sender,
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+
+        composer.set_text_content("draft text".to_string());
+        assert_eq!(composer.clear_for_ctrl_c(), Some("draft text".to_string()));
+        assert!(composer.is_empty());
+
+        assert_eq!(
+            composer.history.navigate_up(&composer.app_event_tx),
+            Some("draft text".to_string())
+        );
     }
 
     #[test]
@@ -1975,6 +2095,35 @@ mod tests {
     }
 
     #[test]
+    fn ascii_prefix_survives_non_ascii_followup() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            true,
+            sender,
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+
+        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+        assert!(composer.is_in_paste_burst());
+
+        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('あ'), KeyModifiers::NONE));
+
+        let (result, _) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match result {
+            InputResult::Submitted(text) => assert_eq!(text, "1あ"),
+            _ => panic!("expected Submitted"),
+        }
+    }
+
+    #[test]
     fn handle_paste_small_inserts_text() {
         use crossterm::event::KeyCode;
         use crossterm::event::KeyEvent;
@@ -2142,7 +2291,7 @@ mod tests {
             }
 
             terminal
-                .draw(|f| f.render_widget_ref(composer, f.area()))
+                .draw(|f| composer.render(f.area(), f.buffer_mut()))
                 .unwrap_or_else(|e| panic!("Failed to draw {name} composer: {e}"));
 
             insta::assert_snapshot!(name, terminal.backend());
@@ -2168,12 +2317,12 @@ mod tests {
         // Type "/mo" humanlike so paste-burst doesn’t interfere.
         type_chars_humanlike(&mut composer, &['/', 'm', 'o']);
 
-        let mut terminal = match Terminal::new(TestBackend::new(60, 4)) {
+        let mut terminal = match Terminal::new(TestBackend::new(60, 5)) {
             Ok(t) => t,
             Err(e) => panic!("Failed to create terminal: {e}"),
         };
         terminal
-            .draw(|f| f.render_widget_ref(composer, f.area()))
+            .draw(|f| composer.render(f.area(), f.buffer_mut()))
             .unwrap_or_else(|e| panic!("Failed to draw composer: {e}"));
 
         // Visual snapshot should show the slash popup with /model as the first entry.
@@ -2875,6 +3024,140 @@ mod tests {
             result
         );
         assert!(composer.textarea.is_empty());
+    }
+
+    #[test]
+    fn custom_prompt_with_large_paste_expands_correctly() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            true,
+            sender,
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+
+        // Create a custom prompt with positional args (no named args like $USER)
+        composer.set_custom_prompts(vec![CustomPrompt {
+            name: "code-review".to_string(),
+            path: "/tmp/code-review.md".to_string().into(),
+            content: "Please review the following code:\n\n$1".to_string(),
+            description: None,
+            argument_hint: None,
+        }]);
+
+        // Type the slash command
+        let command_text = "/prompts:code-review ";
+        composer.textarea.set_text(command_text);
+        composer.textarea.set_cursor(command_text.len());
+
+        // Paste large content (>3000 chars) to trigger placeholder
+        let large_content = "x".repeat(LARGE_PASTE_CHAR_THRESHOLD + 3000);
+        composer.handle_paste(large_content.clone());
+
+        // Verify placeholder was created
+        let placeholder = format!("[Pasted Content {} chars]", large_content.chars().count());
+        assert_eq!(
+            composer.textarea.text(),
+            format!("/prompts:code-review {}", placeholder)
+        );
+        assert_eq!(composer.pending_pastes.len(), 1);
+        assert_eq!(composer.pending_pastes[0].0, placeholder);
+        assert_eq!(composer.pending_pastes[0].1, large_content);
+
+        // Submit by pressing Enter
+        let (result, _needs_redraw) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        // Verify the custom prompt was expanded with the large content as positional arg
+        match result {
+            InputResult::Submitted(text) => {
+                // The prompt should be expanded, with the large content replacing $1
+                assert_eq!(
+                    text,
+                    format!("Please review the following code:\n\n{}", large_content),
+                    "Expected prompt expansion with large content as $1"
+                );
+            }
+            _ => panic!("expected Submitted, got: {result:?}"),
+        }
+        assert!(composer.textarea.is_empty());
+        assert!(composer.pending_pastes.is_empty());
+    }
+
+    #[test]
+    fn slash_path_input_submits_without_command_error() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+
+        let (tx, mut rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            true,
+            sender,
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+
+        composer
+            .textarea
+            .set_text("/Users/example/project/src/main.rs");
+
+        let (result, _needs_redraw) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        if let InputResult::Submitted(text) = result {
+            assert_eq!(text, "/Users/example/project/src/main.rs");
+        } else {
+            panic!("expected Submitted");
+        }
+        assert!(composer.textarea.is_empty());
+        match rx.try_recv() {
+            Ok(event) => panic!("unexpected event: {event:?}"),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+            Err(err) => panic!("unexpected channel state: {err:?}"),
+        }
+    }
+
+    #[test]
+    fn slash_with_leading_space_submits_as_text() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+
+        let (tx, mut rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            true,
+            sender,
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+
+        composer.textarea.set_text(" /this-looks-like-a-command");
+
+        let (result, _needs_redraw) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        if let InputResult::Submitted(text) = result {
+            assert_eq!(text, "/this-looks-like-a-command");
+        } else {
+            panic!("expected Submitted");
+        }
+        assert!(composer.textarea.is_empty());
+        match rx.try_recv() {
+            Ok(event) => panic!("unexpected event: {event:?}"),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+            Err(err) => panic!("unexpected channel state: {err:?}"),
+        }
     }
 
     #[test]
