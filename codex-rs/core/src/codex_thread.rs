@@ -21,6 +21,7 @@ use crate::state_db::StateDbHandle;
 pub struct ThreadConfigSnapshot {
     pub model: String,
     pub model_provider_id: String,
+    pub suppress_cyber_safety_warning: bool,
     pub approval_policy: AskForApproval,
     pub sandbox_policy: SandboxPolicy,
     pub cwd: PathBuf,

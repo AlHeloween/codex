@@ -3,6 +3,7 @@ use app_test_support::McpProcess;
 use app_test_support::to_response;
 use codex_app_server_protocol::ItemCompletedNotification;
 use codex_app_server_protocol::ItemStartedNotification;
+use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
@@ -36,7 +37,7 @@ async fn openai_model_header_mismatch_emits_warning_item_v2() -> Result<()> {
     let _response_mock = responses::mount_response_once(&server, response).await;
 
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
+    create_config_toml(codex_home.path(), &server.uri(), false)?;
 
     let mut mcp = McpProcess::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
@@ -141,7 +142,7 @@ async fn response_model_field_mismatch_emits_warning_item_v2_when_header_matches
     let _response_mock = responses::mount_response_once(&server, response).await;
 
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
+    create_config_toml(codex_home.path(), &server.uri(), false)?;
 
     let mut mcp = McpProcess::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
@@ -222,6 +223,88 @@ async fn response_model_field_mismatch_emits_warning_item_v2_when_header_matches
     Ok(())
 }
 
+#[tokio::test]
+async fn suppress_cyber_safety_warning_hides_warning_item_v2() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let body = responses::sse(vec![
+        responses::ev_response_created("resp-1"),
+        responses::ev_assistant_message("msg-1", "Done"),
+        responses::ev_completed("resp-1"),
+    ]);
+    let response = responses::sse_response(body).insert_header("OpenAI-Model", SERVER_MODEL);
+    let _response_mock = responses::mount_response_once(&server, response).await;
+
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri(), true)?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let thread_req = mcp
+        .send_thread_start_request(ThreadStartParams {
+            model: Some(REQUESTED_MODEL.to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let thread_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(thread_req)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(thread_resp)?;
+
+    let turn_req = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            input: vec![UserInput::Text {
+                text: "trigger suppressed safeguard".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    let _turn_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
+    )
+    .await??;
+    let _turn_start: TurnStartResponse = to_response(_turn_resp)?;
+
+    // This is a negative assertion: ensure we reach turn completion without seeing
+    // a cyber safety warning item.
+    timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            let message = mcp.read_next_message().await?;
+            if let JSONRPCMessage::Notification(notification) = message {
+                if notification.method == "item/started" || notification.method == "item/completed"
+                {
+                    let params = notification.params.expect("item params");
+                    let item = if notification.method == "item/started" {
+                        let started: ItemStartedNotification =
+                            serde_json::from_value(params).expect("deserialize item/started");
+                        started.item
+                    } else {
+                        let completed: ItemCompletedNotification =
+                            serde_json::from_value(params).expect("deserialize item/completed");
+                        completed.item
+                    };
+                    if warning_text_from_item(&item).is_some_and(is_cyber_model_warning_text) {
+                        anyhow::bail!("expected cyber safety warning item to be suppressed");
+                    }
+                }
+                if notification.method == "turn/completed" {
+                    return Ok::<(), anyhow::Error>(());
+                }
+            }
+        }
+    })
+    .await??;
+
+    Ok(())
+}
+
 fn warning_text_from_item(item: &ThreadItem) -> Option<&str> {
     let ThreadItem::UserMessage { content, .. } = item else {
         return None;
@@ -238,8 +321,17 @@ fn is_cyber_model_warning_text(text: &str) -> bool {
         && text.contains("apply for trusted access: https://chatgpt.com/cyber")
 }
 
-fn create_config_toml(codex_home: &std::path::Path, server_uri: &str) -> std::io::Result<()> {
+fn create_config_toml(
+    codex_home: &std::path::Path,
+    server_uri: &str,
+    suppress_cyber_safety_warning: bool,
+) -> std::io::Result<()> {
     let config_toml = codex_home.join("config.toml");
+    let suppress = if suppress_cyber_safety_warning {
+        "true"
+    } else {
+        "false"
+    };
     std::fs::write(
         config_toml,
         format!(
@@ -247,6 +339,8 @@ fn create_config_toml(codex_home: &std::path::Path, server_uri: &str) -> std::io
 model = "{REQUESTED_MODEL}"
 approval_policy = "never"
 sandbox_mode = "read-only"
+
+suppress_cyber_safety_warning = {suppress}
 
 model_provider = "mock_provider"
 

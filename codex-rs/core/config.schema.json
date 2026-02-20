@@ -1712,6 +1712,10 @@
       ],
       "description": "User-level skill config entries keyed by SKILL.md path."
     },
+    "suppress_cyber_safety_warning": {
+      "description": "Suppress the \"high-risk cyber activity\" model downgrade warning message.\n\nThis only suppresses emitting the warning message; it does not change server-side routing or model selection.",
+      "type": "boolean"
+    },
     "suppress_unstable_features_warning": {
       "description": "Suppress warnings about unstable (under development) features.",
       "type": "boolean"

@@ -120,6 +120,10 @@ pub(crate) async fn apply_bespoke_event_handling(
         id: event_turn_id,
         msg,
     } = event;
+    let suppress_cyber_safety_warning = conversation
+        .config_snapshot()
+        .await
+        .suppress_cyber_safety_warning;
     match msg {
         EventMsg::TurnStarted(_) => {}
         EventMsg::TurnComplete(_ev) => {
@@ -128,6 +132,7 @@ pub(crate) async fn apply_bespoke_event_handling(
         EventMsg::Warning(warning_event) => {
             if matches!(api_version, ApiVersion::V2)
                 && is_safety_check_downgrade_warning(&warning_event.message)
+                && !suppress_cyber_safety_warning
             {
                 let item = ThreadItem::UserMessage {
                     id: warning_item_id(&event_turn_id, &warning_event.message),

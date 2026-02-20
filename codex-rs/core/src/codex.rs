@@ -754,6 +754,9 @@ impl SessionConfiguration {
         ThreadConfigSnapshot {
             model: self.collaboration_mode.model().to_string(),
             model_provider_id: self.original_config_do_not_use.model_provider_id.clone(),
+            suppress_cyber_safety_warning: self
+                .original_config_do_not_use
+                .suppress_cyber_safety_warning,
             approval_policy: self.approval_policy.value(),
             sandbox_policy: self.sandbox_policy.get().clone(),
             cwd: self.cwd.clone(),
@@ -2567,6 +2570,10 @@ impl Session {
         turn_context: &Arc<TurnContext>,
         server_model: String,
     ) -> bool {
+        if turn_context.config.suppress_cyber_safety_warning {
+            return false;
+        }
+
         let requested_model = turn_context.model_info.slug.as_str();
         if server_model == requested_model {
             info!("server reported model {server_model} (matches requested model)");

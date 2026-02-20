@@ -226,3 +226,55 @@ async fn openai_model_header_mismatch_only_emits_one_warning_per_turn() -> Resul
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn suppress_cyber_safety_warning_hides_model_mismatch_warning() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let response =
+        sse_response(sse_completed("resp-1")).insert_header("OpenAI-Model", SERVER_MODEL);
+    let _mock = mount_response_once(&server, response).await;
+
+    let mut builder = test_codex()
+        .with_model(REQUESTED_MODEL)
+        .with_config(|config| {
+            config.suppress_cyber_safety_warning = true;
+        });
+    let test = builder.build(&server).await?;
+
+    test.codex
+        .submit(Op::UserTurn {
+            items: vec![UserInput::Text {
+                text: "trigger safety check".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            cwd: test.cwd_path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            model: REQUESTED_MODEL.to_string(),
+            effort: test.config.model_reasoning_effort,
+            summary: ReasoningSummary::Auto,
+            collaboration_mode: None,
+            personality: None,
+        })
+        .await?;
+
+    loop {
+        let event = wait_for_event(&test.codex, |_| true).await;
+        match event {
+            EventMsg::Warning(warning)
+                if warning
+                    .message
+                    .contains("flagged for potentially high-risk cyber activity") =>
+            {
+                panic!("expected cyber safety warning to be suppressed");
+            }
+            EventMsg::TurnComplete(_) => break,
+            _ => {}
+        }
+    }
+
+    Ok(())
+}

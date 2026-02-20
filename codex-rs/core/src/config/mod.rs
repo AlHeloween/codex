@@ -372,6 +372,13 @@ pub struct Config {
     /// When `true`, suppress warnings about unstable (under development) features.
     pub suppress_unstable_features_warning: bool,
 
+    /// When `true`, suppress the "high-risk cyber activity" model downgrade warning
+    /// message (the one that links to https://chatgpt.com/cyber).
+    ///
+    /// This only suppresses the warning UI/message emission; it does not change
+    /// server-side routing or model selection.
+    pub suppress_cyber_safety_warning: bool,
+
     /// The active profile name used to derive this `Config` (if any).
     pub active_profile: Option<String>,
 
@@ -1032,6 +1039,12 @@ pub struct ConfigToml {
 
     /// Suppress warnings about unstable (under development) features.
     pub suppress_unstable_features_warning: Option<bool>,
+
+    /// Suppress the "high-risk cyber activity" model downgrade warning message.
+    ///
+    /// This only suppresses emitting the warning message; it does not change
+    /// server-side routing or model selection.
+    pub suppress_cyber_safety_warning: Option<bool>,
 
     /// Settings for ghost snapshots (used for undo).
     #[serde(default)]
@@ -1825,6 +1838,7 @@ impl Config {
             suppress_unstable_features_warning: cfg
                 .suppress_unstable_features_warning
                 .unwrap_or(false),
+            suppress_cyber_safety_warning: cfg.suppress_cyber_safety_warning.unwrap_or(false),
             active_profile: active_profile_name,
             active_project,
             windows_wsl_setup_acknowledged: cfg.windows_wsl_setup_acknowledged.unwrap_or(false),
@@ -4144,6 +4158,7 @@ model_verbosity = "high"
                 ghost_snapshot: GhostSnapshotConfig::default(),
                 features: Features::with_defaults(),
                 suppress_unstable_features_warning: false,
+                suppress_cyber_safety_warning: false,
                 active_profile: Some("o3".to_string()),
                 active_project: ProjectConfig { trust_level: None },
                 windows_wsl_setup_acknowledged: false,
@@ -4255,6 +4270,7 @@ model_verbosity = "high"
             ghost_snapshot: GhostSnapshotConfig::default(),
             features: Features::with_defaults(),
             suppress_unstable_features_warning: false,
+            suppress_cyber_safety_warning: false,
             active_profile: Some("gpt3".to_string()),
             active_project: ProjectConfig { trust_level: None },
             windows_wsl_setup_acknowledged: false,
@@ -4364,6 +4380,7 @@ model_verbosity = "high"
             ghost_snapshot: GhostSnapshotConfig::default(),
             features: Features::with_defaults(),
             suppress_unstable_features_warning: false,
+            suppress_cyber_safety_warning: false,
             active_profile: Some("zdr".to_string()),
             active_project: ProjectConfig { trust_level: None },
             windows_wsl_setup_acknowledged: false,
@@ -4459,6 +4476,7 @@ model_verbosity = "high"
             ghost_snapshot: GhostSnapshotConfig::default(),
             features: Features::with_defaults(),
             suppress_unstable_features_warning: false,
+            suppress_cyber_safety_warning: false,
             active_profile: Some("gpt5".to_string()),
             active_project: ProjectConfig { trust_level: None },
             windows_wsl_setup_acknowledged: false,
