@@ -27,7 +27,7 @@ If you use an editor with TOML + JSON-schema support, you can point it at this f
 
 ## Configuration precedence (what wins?)
 
-Codex merges configuration from multiple “levels”. When the same setting is defined in more than one place, **higher precedence wins**.
+Codex merges configuration from multiple "levels". When the same setting is defined in more than one place, **higher precedence wins**.
 
 Precedence (highest to lowest) is:
 
@@ -53,7 +53,7 @@ sandbox_mode = "read-only"
 
 ### Profiles (recommended)
 
-Use profiles when you want to switch between coherent “bundles” of settings.
+Use profiles when you want to switch between coherent "bundles" of settings.
 
 ```toml
 profile = "work"
@@ -87,7 +87,7 @@ codex -c suppress_cyber_safety_warning=true
 
 ## Core top-level keys
 
-This section describes the most important keys you’re likely to set directly.
+This section describes the most important keys you're likely to set directly.
 
 ### `model`
 
@@ -134,7 +134,7 @@ wire_api = "responses"
 
 ### `approval_policy`
 
-Controls *when* Codex asks you before executing commands.
+Controls _when_ Codex asks you before executing commands.
 
 Common values:
 
@@ -150,7 +150,7 @@ approval_policy = "untrusted"
 
 ### `sandbox_mode`
 
-Controls *how* command execution is sandboxed.
+Controls _how_ command execution is sandboxed.
 
 Common values:
 
@@ -240,9 +240,15 @@ Common items include:
 - Notification preferences
 - Status line configuration
 
+## SQLite State DB
+
+Codex stores the SQLite-backed state DB under `sqlite_home` (config key) or the
+`CODEX_SQLITE_HOME` environment variable. When unset, WorkspaceWrite sandbox
+sessions default to a temp directory; other modes default to `CODEX_HOME`.
+
 ## Notices (`[notice]`)
 
-Codex stores “do not show again” flags for some UI prompts under the `[notice]` table.
+Codex stores "do not show again" flags for some UI prompts under the `[notice]` table.
 
 Example behavior:
 
@@ -254,7 +260,7 @@ Codex emits some warning messages as part of normal operation.
 
 ### `suppress_cyber_safety_warning`
 
-To suppress the specific “high-risk cyber activity” model downgrade warning message (the one that links to https://chatgpt.com/cyber), set:
+To suppress the specific "high-risk cyber activity" model downgrade warning message (the one that links to https://chatgpt.com/cyber), set:
 
 ```toml
 suppress_cyber_safety_warning = true
@@ -264,3 +270,14 @@ Important:
 
 - This only hides the warning **message**.
 - It does **not** change server-side routing, sandbox behavior, approvals, or model selection.
+
+## Plan mode defaults
+
+`plan_mode_reasoning_effort` lets you set a Plan-mode-specific default reasoning
+effort override. When unset, Plan mode uses the built-in Plan preset default
+(currently `medium`). When explicitly set (including `none`), it overrides the
+Plan preset. The string value `none` means "no reasoning" (an explicit Plan
+override), not "inherit the global default". There is currently no separate
+config value for "follow the global default in Plan mode".
+
+Ctrl+C/Ctrl+D quitting uses a ~1 second double-press hint (`ctrl + c again to quit`).
