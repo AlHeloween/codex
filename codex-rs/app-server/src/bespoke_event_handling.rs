@@ -77,6 +77,7 @@ use codex_app_server_protocol::TurnInterruptResponse;
 use codex_app_server_protocol::TurnPlanStep;
 use codex_app_server_protocol::TurnPlanUpdatedNotification;
 use codex_app_server_protocol::TurnStatus;
+use codex_app_server_protocol::UserInput;
 use codex_app_server_protocol::build_turns_from_rollout_items;
 use codex_app_server_protocol::convert_patch_changes;
 use codex_core::CodexThread;
@@ -169,21 +170,23 @@ pub(crate) async fn apply_bespoke_event_handling(
             {
                 let item = ThreadItem::UserMessage {
                     id: warning_item_id(&event_turn_id, &warning_event.message),
-                    content: vec![V2UserInput::Text {
+                    content: vec![UserInput::Text {
                         text: format!("Warning: {}", warning_event.message),
                         text_elements: Vec::new(),
                     }],
                 };
                 let started = ItemStartedNotification {
                     thread_id: conversation_id.to_string(),
-                    item_id: item.id.clone(),
+                    turn_id: event_turn_id.clone(),
+                    item: item.clone(),
                 };
                 outgoing
                     .send_server_notification(ServerNotification::ItemStarted(started))
                     .await;
                 let completed = ItemCompletedNotification {
                     thread_id: conversation_id.to_string(),
-                    item_id: item.id,
+                    turn_id: event_turn_id.clone(),
+                    item,
                 };
                 outgoing
                     .send_server_notification(ServerNotification::ItemCompleted(completed))
@@ -2876,4 +2879,14 @@ mod tests {
         assert!(rx.try_recv().is_err(), "no messages expected");
         Ok(())
     }
+}
+
+const CYBER_SAFETY_WARNING_SUBSTRING: &str = "flagged for potentially high-risk cyber activity";
+
+fn is_safety_check_downgrade_warning(message: &str) -> bool {
+    message.contains(CYBER_SAFETY_WARNING_SUBSTRING)
+}
+
+fn warning_item_id(turn_id: &str, message: &str) -> String {
+    format!("warning-{}-{}", turn_id, &message[..message.len().min(20)])
 }
