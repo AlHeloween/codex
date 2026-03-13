@@ -6,6 +6,8 @@ use crate::error_code::INTERNAL_ERROR_CODE;
 use crate::error_code::INVALID_REQUEST_ERROR_CODE;
 use crate::outgoing_message::ClientRequestResult;
 use crate::outgoing_message::ThreadScopedOutgoingMessageSender;
+use crate::server_request_error::is_turn_transition_server_request_error;
+use crate::thread_state::ThreadListenerCommand;
 use crate::thread_state::ThreadState;
 use crate::thread_state::TurnSummary;
 use crate::thread_status::ThreadWatchActiveGuard;
@@ -24,10 +26,13 @@ use codex_app_server_protocol::CommandExecutionApprovalDecision;
 use codex_app_server_protocol::CommandExecutionOutputDeltaNotification;
 use codex_app_server_protocol::CommandExecutionRequestApprovalParams;
 use codex_app_server_protocol::CommandExecutionRequestApprovalResponse;
+use codex_app_server_protocol::CommandExecutionRequestApprovalSkillMetadata;
 use codex_app_server_protocol::CommandExecutionStatus;
 use codex_app_server_protocol::ContextCompactedNotification;
 use codex_app_server_protocol::DeprecationNoticeNotification;
+use codex_app_server_protocol::DynamicToolCallOutputContentItem;
 use codex_app_server_protocol::DynamicToolCallParams;
+use codex_app_server_protocol::DynamicToolCallStatus;
 use codex_app_server_protocol::ErrorNotification;
 use codex_app_server_protocol::ExecCommandApprovalParams;
 use codex_app_server_protocol::ExecCommandApprovalResponse;
@@ -37,10 +42,16 @@ use codex_app_server_protocol::FileChangeOutputDeltaNotification;
 use codex_app_server_protocol::FileChangeRequestApprovalParams;
 use codex_app_server_protocol::FileChangeRequestApprovalResponse;
 use codex_app_server_protocol::FileUpdateChange;
+use codex_app_server_protocol::GrantedPermissionProfile as V2GrantedPermissionProfile;
+use codex_app_server_protocol::HookCompletedNotification;
+use codex_app_server_protocol::HookStartedNotification;
 use codex_app_server_protocol::InterruptConversationResponse;
 use codex_app_server_protocol::ItemCompletedNotification;
 use codex_app_server_protocol::ItemStartedNotification;
 use codex_app_server_protocol::JSONRPCErrorError;
+use codex_app_server_protocol::McpServerElicitationAction;
+use codex_app_server_protocol::McpServerElicitationRequestParams;
+use codex_app_server_protocol::McpServerElicitationRequestResponse;
 use codex_app_server_protocol::McpToolCallError;
 use codex_app_server_protocol::McpToolCallResult;
 use codex_app_server_protocol::McpToolCallStatus;
@@ -49,19 +60,25 @@ use codex_app_server_protocol::NetworkApprovalContext as V2NetworkApprovalContex
 use codex_app_server_protocol::NetworkPolicyAmendment as V2NetworkPolicyAmendment;
 use codex_app_server_protocol::NetworkPolicyRuleAction as V2NetworkPolicyRuleAction;
 use codex_app_server_protocol::PatchApplyStatus;
+use codex_app_server_protocol::PermissionsRequestApprovalParams;
+use codex_app_server_protocol::PermissionsRequestApprovalResponse;
 use codex_app_server_protocol::PlanDeltaNotification;
 use codex_app_server_protocol::RawResponseItemCompletedNotification;
 use codex_app_server_protocol::ReasoningSummaryPartAddedNotification;
 use codex_app_server_protocol::ReasoningSummaryTextDeltaNotification;
 use codex_app_server_protocol::ReasoningTextDeltaNotification;
+use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequestPayload;
-use codex_app_server_protocol::SkillApprovalDecision as V2SkillApprovalDecision;
-use codex_app_server_protocol::SkillRequestApprovalParams;
-use codex_app_server_protocol::SkillRequestApprovalResponse;
+use codex_app_server_protocol::SkillsChangedNotification;
 use codex_app_server_protocol::TerminalInteractionNotification;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadNameUpdatedNotification;
+use codex_app_server_protocol::ThreadRealtimeClosedNotification;
+use codex_app_server_protocol::ThreadRealtimeErrorNotification;
+use codex_app_server_protocol::ThreadRealtimeItemAddedNotification;
+use codex_app_server_protocol::ThreadRealtimeOutputAudioDeltaNotification;
+use codex_app_server_protocol::ThreadRealtimeStartedNotification;
 use codex_app_server_protocol::ThreadRollbackResponse;
 use codex_app_server_protocol::ThreadTokenUsage;
 use codex_app_server_protocol::ThreadTokenUsageUpdatedNotification;
@@ -76,6 +93,7 @@ use codex_app_server_protocol::TurnError;
 use codex_app_server_protocol::TurnInterruptResponse;
 use codex_app_server_protocol::TurnPlanStep;
 use codex_app_server_protocol::TurnPlanUpdatedNotification;
+use codex_app_server_protocol::TurnStartedNotification;
 use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::UserInput;
 use codex_app_server_protocol::build_turns_from_rollout_items;
@@ -85,9 +103,11 @@ use codex_core::ThreadManager;
 use codex_core::find_thread_name_by_id;
 use codex_core::review_format::format_review_findings_block;
 use codex_core::review_prompts;
+use codex_core::sandboxing::intersect_permission_profiles;
 use codex_protocol::ThreadId;
 use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem as CoreDynamicToolCallOutputContentItem;
 use codex_protocol::dynamic_tools::DynamicToolResponse as CoreDynamicToolResponse;
+use codex_protocol::models::PermissionProfile as CorePermissionProfile;
 use codex_protocol::plan_tool::UpdatePlanArgs;
 use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
 use codex_protocol::protocol::CodexErrorInfo as CoreCodexErrorInfo;
@@ -98,13 +118,16 @@ use codex_protocol::protocol::ExecCommandEndEvent;
 use codex_protocol::protocol::McpToolCallBeginEvent;
 use codex_protocol::protocol::McpToolCallEndEvent;
 use codex_protocol::protocol::Op;
+use codex_protocol::protocol::RealtimeEvent;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::ReviewOutputEvent;
 use codex_protocol::protocol::TokenCountEvent;
 use codex_protocol::protocol::TurnDiffEvent;
+use codex_protocol::request_permissions::PermissionGrantScope as CorePermissionGrantScope;
+use codex_protocol::request_permissions::RequestPermissionProfile as CoreRequestPermissionProfile;
+use codex_protocol::request_permissions::RequestPermissionsResponse as CoreRequestPermissionsResponse;
 use codex_protocol::request_user_input::RequestUserInputAnswer as CoreRequestUserInputAnswer;
 use codex_protocol::request_user_input::RequestUserInputResponse as CoreRequestUserInputResponse;
-use codex_protocol::skill_approval::SkillApprovalResponse as CoreSkillApprovalResponse;
 use codex_shell_command::parse_command::shlex_join;
 use std::collections::HashMap;
 use std::convert::TryFrom;
@@ -129,6 +152,38 @@ struct CommandExecutionCompletionItem {
     command_actions: Vec<V2ParsedCommand>,
 }
 
+async fn resolve_server_request_on_thread_listener(
+    thread_state: &Arc<Mutex<ThreadState>>,
+    request_id: RequestId,
+) {
+    let (completion_tx, completion_rx) = oneshot::channel();
+    let listener_command_tx = {
+        let state = thread_state.lock().await;
+        state.listener_command_tx()
+    };
+    let Some(listener_command_tx) = listener_command_tx else {
+        error!("failed to remove pending client request: thread listener is not running");
+        return;
+    };
+
+    if listener_command_tx
+        .send(ThreadListenerCommand::ResolveServerRequest {
+            request_id,
+            completion_tx,
+        })
+        .is_err()
+    {
+        error!(
+            "failed to remove pending client request: thread listener command channel is closed"
+        );
+        return;
+    }
+
+    if let Err(err) = completion_rx.await {
+        error!("failed to remove pending client request: {err}");
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn apply_bespoke_event_handling(
     event: Event,
@@ -151,17 +206,48 @@ pub(crate) async fn apply_bespoke_event_handling(
         .await
         .suppress_cyber_safety_warning;
     match msg {
-        EventMsg::TurnStarted(_) => {
+        EventMsg::TurnStarted(payload) => {
+            // While not technically necessary as it was already done on TurnComplete, be extra cautios and abort any pending server requests.
+            outgoing.abort_pending_server_requests().await;
             thread_watch_manager
                 .note_turn_started(&conversation_id.to_string())
                 .await;
+            if let ApiVersion::V2 = api_version {
+                let turn = {
+                    let state = thread_state.lock().await;
+                    state.active_turn_snapshot().unwrap_or_else(|| Turn {
+                        id: payload.turn_id.clone(),
+                        items: Vec::new(),
+                        error: None,
+                        status: TurnStatus::InProgress,
+                    })
+                };
+                let notification = TurnStartedNotification {
+                    thread_id: conversation_id.to_string(),
+                    turn,
+                };
+                outgoing
+                    .send_server_notification(ServerNotification::TurnStarted(notification))
+                    .await;
+            }
         }
         EventMsg::TurnComplete(_ev) => {
+            // All per-thread requests are bound to a turn, so abort them.
+            outgoing.abort_pending_server_requests().await;
             let turn_failed = thread_state.lock().await.turn_summary.last_error.is_some();
             thread_watch_manager
                 .note_turn_completed(&conversation_id.to_string(), turn_failed)
                 .await;
             handle_turn_complete(conversation_id, event_turn_id, &outgoing, &thread_state).await;
+        }
+        EventMsg::SkillsUpdateAvailable => {
+            if let ApiVersion::V2 = api_version {
+                outgoing
+                    .send_server_notification(ServerNotification::SkillsChanged(
+                        SkillsChangedNotification {},
+                    ))
+                    .await;
+            }
         }
         EventMsg::Warning(warning_event) => {
             if matches!(api_version, ApiVersion::V2)
@@ -207,6 +293,92 @@ pub(crate) async fn apply_bespoke_event_handling(
                     .await;
             }
         }
+        EventMsg::RealtimeConversationStarted(event) => {
+            if let ApiVersion::V2 = api_version {
+                let notification = ThreadRealtimeStartedNotification {
+                    thread_id: conversation_id.to_string(),
+                    session_id: event.session_id,
+                };
+                outgoing
+                    .send_server_notification(ServerNotification::ThreadRealtimeStarted(
+                        notification,
+                    ))
+                    .await;
+            }
+        }
+        EventMsg::RealtimeConversationRealtime(event) => {
+            if let ApiVersion::V2 = api_version {
+                match event.payload {
+                    RealtimeEvent::SessionUpdated { .. } => {}
+                    RealtimeEvent::InputTranscriptDelta(_) => {}
+                    RealtimeEvent::OutputTranscriptDelta(_) => {}
+                    RealtimeEvent::AudioOut(audio) => {
+                        let notification = ThreadRealtimeOutputAudioDeltaNotification {
+                            thread_id: conversation_id.to_string(),
+                            audio: audio.into(),
+                        };
+                        outgoing
+                            .send_server_notification(
+                                ServerNotification::ThreadRealtimeOutputAudioDelta(notification),
+                            )
+                            .await;
+                    }
+                    RealtimeEvent::ConversationItemAdded(item) => {
+                        let notification = ThreadRealtimeItemAddedNotification {
+                            thread_id: conversation_id.to_string(),
+                            item,
+                        };
+                        outgoing
+                            .send_server_notification(ServerNotification::ThreadRealtimeItemAdded(
+                                notification,
+                            ))
+                            .await;
+                    }
+                    RealtimeEvent::ConversationItemDone { .. } => {}
+                    RealtimeEvent::HandoffRequested(handoff) => {
+                        let notification = ThreadRealtimeItemAddedNotification {
+                            thread_id: conversation_id.to_string(),
+                            item: serde_json::json!({
+                                "type": "handoff_request",
+                                "handoff_id": handoff.handoff_id,
+                                "item_id": handoff.item_id,
+                                "input_transcript": handoff.input_transcript,
+                                "active_transcript": handoff.active_transcript,
+                            }),
+                        };
+                        outgoing
+                            .send_server_notification(ServerNotification::ThreadRealtimeItemAdded(
+                                notification,
+                            ))
+                            .await;
+                    }
+                    RealtimeEvent::Error(message) => {
+                        let notification = ThreadRealtimeErrorNotification {
+                            thread_id: conversation_id.to_string(),
+                            message,
+                        };
+                        outgoing
+                            .send_server_notification(ServerNotification::ThreadRealtimeError(
+                                notification,
+                            ))
+                            .await;
+                    }
+                }
+            }
+        }
+        EventMsg::RealtimeConversationClosed(event) => {
+            if let ApiVersion::V2 = api_version {
+                let notification = ThreadRealtimeClosedNotification {
+                    thread_id: conversation_id.to_string(),
+                    reason: event.reason,
+                };
+                outgoing
+                    .send_server_notification(ServerNotification::ThreadRealtimeClosed(
+                        notification,
+                    ))
+                    .await;
+            }
+        }
         EventMsg::ApplyPatchApprovalRequest(ApplyPatchApprovalRequestEvent {
             call_id,
             turn_id,
@@ -226,7 +398,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                         reason,
                         grant_root,
                     };
-                    let rx = outgoing
+                    let (_pending_request_id, rx) = outgoing
                         .send_request(ServerRequestPayload::ApplyPatchApproval(params))
                         .await;
                     tokio::spawn(async move {
@@ -270,7 +442,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                         reason,
                         grant_root,
                     };
-                    let rx = outgoing
+                    let (pending_request_id, rx) = outgoing
                         .send_request(ServerRequestPayload::FileChangeRequestApproval(params))
                         .await;
                     tokio::spawn(async move {
@@ -279,6 +451,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                             conversation_id,
                             item_id,
                             patch_changes,
+                            pending_request_id,
                             rx,
                             conversation,
                             outgoing,
@@ -295,6 +468,11 @@ pub(crate) async fn apply_bespoke_event_handling(
                 .note_permission_requested(&conversation_id.to_string())
                 .await;
             let approval_id_for_op = ev.effective_approval_id();
+            let available_decisions = ev
+                .effective_available_decisions()
+                .into_iter()
+                .map(CommandExecutionApprovalDecision::from)
+                .collect::<Vec<_>>();
             let ExecApprovalRequestEvent {
                 call_id,
                 approval_id,
@@ -306,6 +484,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 proposed_execpolicy_amendment,
                 proposed_network_policy_amendments,
                 additional_permissions,
+                skill_metadata,
                 parsed_cmd,
                 ..
             } = ev;
@@ -320,7 +499,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                         reason,
                         parsed_cmd,
                     };
-                    let rx = outgoing
+                    let (_pending_request_id, rx) = outgoing
                         .send_request(ServerRequestPayload::ExecCommandApproval(params))
                         .await;
                     tokio::spawn(async move {
@@ -377,6 +556,8 @@ pub(crate) async fn apply_bespoke_event_handling(
                         });
                     let additional_permissions =
                         additional_permissions.map(V2AdditionalPermissionProfile::from);
+                    let skill_metadata =
+                        skill_metadata.map(CommandExecutionRequestApprovalSkillMetadata::from);
 
                     let params = CommandExecutionRequestApprovalParams {
                         thread_id: conversation_id.to_string(),
@@ -389,10 +570,12 @@ pub(crate) async fn apply_bespoke_event_handling(
                         cwd,
                         command_actions,
                         additional_permissions,
+                        skill_metadata,
                         proposed_execpolicy_amendment: proposed_execpolicy_amendment_v2,
                         proposed_network_policy_amendments: proposed_network_policy_amendments_v2,
+                        available_decisions: Some(available_decisions),
                     };
-                    let rx = outgoing
+                    let (pending_request_id, rx) = outgoing
                         .send_request(ServerRequestPayload::CommandExecutionRequestApproval(
                             params,
                         ))
@@ -404,6 +587,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                             approval_id,
                             call_id,
                             completion_item,
+                            pending_request_id,
                             rx,
                             conversation,
                             outgoing,
@@ -446,14 +630,16 @@ pub(crate) async fn apply_bespoke_event_handling(
                     item_id: request.call_id,
                     questions,
                 };
-                let rx = outgoing
+                let (pending_request_id, rx) = outgoing
                     .send_request(ServerRequestPayload::ToolRequestUserInput(params))
                     .await;
                 tokio::spawn(async move {
                     on_request_user_input_response(
                         event_turn_id,
+                        pending_request_id,
                         rx,
                         conversation,
+                        thread_state,
                         user_input_guard,
                     )
                     .await;
@@ -477,48 +663,145 @@ pub(crate) async fn apply_bespoke_event_handling(
                 }
             }
         }
-        EventMsg::SkillRequestApproval(request) => {
+        EventMsg::ElicitationRequest(request) => {
             if matches!(api_version, ApiVersion::V2) {
-                let item_id = request.item_id;
-                let skill_name = request.skill_name;
-                let params = SkillRequestApprovalParams {
-                    item_id: item_id.clone(),
-                    skill_name,
+                let permission_guard = thread_watch_manager
+                    .note_permission_requested(&conversation_id.to_string())
+                    .await;
+                let turn_id = match request.turn_id.clone() {
+                    Some(turn_id) => Some(turn_id),
+                    None => {
+                        let state = thread_state.lock().await;
+                        state.active_turn_snapshot().map(|turn| turn.id)
+                    }
                 };
-                let rx = outgoing
-                    .send_request(ServerRequestPayload::SkillRequestApproval(params))
+                let server_name = request.server_name.clone();
+                let request_body = match request.request.try_into() {
+                    Ok(request_body) => request_body,
+                    Err(err) => {
+                        error!(
+                            error = %err,
+                            server_name,
+                            request_id = ?request.id,
+                            "failed to parse typed MCP elicitation schema"
+                        );
+                        if let Err(err) = conversation
+                            .submit(Op::ResolveElicitation {
+                                server_name: request.server_name,
+                                request_id: request.id,
+                                decision: codex_protocol::approvals::ElicitationAction::Cancel,
+                                content: None,
+                                meta: None,
+                            })
+                            .await
+                        {
+                            error!("failed to submit ResolveElicitation: {err}");
+                        }
+                        return;
+                    }
+                };
+                let params = McpServerElicitationRequestParams {
+                    thread_id: conversation_id.to_string(),
+                    turn_id,
+                    server_name: request.server_name.clone(),
+                    request: request_body,
+                };
+                let (pending_request_id, rx) = outgoing
+                    .send_request(ServerRequestPayload::McpServerElicitationRequest(params))
                     .await;
                 tokio::spawn(async move {
-                    let approved = match rx.await {
-                        Ok(Ok(value)) => {
-                            serde_json::from_value::<SkillRequestApprovalResponse>(value)
-                                .map(|response| {
-                                    matches!(response.decision, V2SkillApprovalDecision::Approve)
-                                })
-                                .unwrap_or(false)
-                        }
-                        _ => false,
-                    };
-                    let _ = conversation
-                        .submit(Op::SkillApproval {
-                            id: item_id,
-                            response: CoreSkillApprovalResponse { approved },
-                        })
-                        .await;
+                    on_mcp_server_elicitation_response(
+                        request.server_name,
+                        request.id,
+                        pending_request_id,
+                        rx,
+                        conversation,
+                        thread_state,
+                        permission_guard,
+                    )
+                    .await;
                 });
+            }
+        }
+        EventMsg::RequestPermissions(request) => {
+            if matches!(api_version, ApiVersion::V2) {
+                let permission_guard = thread_watch_manager
+                    .note_permission_requested(&conversation_id.to_string())
+                    .await;
+                let requested_permissions = request.permissions.clone();
+                let params = PermissionsRequestApprovalParams {
+                    thread_id: conversation_id.to_string(),
+                    turn_id: request.turn_id.clone(),
+                    item_id: request.call_id.clone(),
+                    reason: request.reason,
+                    permissions: CorePermissionProfile::from(request.permissions).into(),
+                };
+                let (pending_request_id, rx) = outgoing
+                    .send_request(ServerRequestPayload::PermissionsRequestApproval(params))
+                    .await;
+                tokio::spawn(async move {
+                    on_request_permissions_response(
+                        request.call_id,
+                        requested_permissions,
+                        pending_request_id,
+                        rx,
+                        conversation,
+                        thread_state,
+                        permission_guard,
+                    )
+                    .await;
+                });
+            } else {
+                error!(
+                    "request_permissions is only supported on api v2 (call_id: {})",
+                    request.call_id
+                );
+                let empty = CoreRequestPermissionsResponse {
+                    permissions: Default::default(),
+                    scope: CorePermissionGrantScope::Turn,
+                };
+                if let Err(err) = conversation
+                    .submit(Op::RequestPermissionsResponse {
+                        id: request.call_id,
+                        response: empty,
+                    })
+                    .await
+                {
+                    error!("failed to submit RequestPermissionsResponse: {err}");
+                }
             }
         }
         EventMsg::DynamicToolCallRequest(request) => {
             if matches!(api_version, ApiVersion::V2) {
                 let call_id = request.call_id;
+                let turn_id = request.turn_id;
+                let tool = request.tool;
+                let arguments = request.arguments;
+                let item = ThreadItem::DynamicToolCall {
+                    id: call_id.clone(),
+                    tool: tool.clone(),
+                    arguments: arguments.clone(),
+                    status: DynamicToolCallStatus::InProgress,
+                    content_items: None,
+                    success: None,
+                    duration_ms: None,
+                };
+                let notification = ItemStartedNotification {
+                    thread_id: conversation_id.to_string(),
+                    turn_id: turn_id.clone(),
+                    item,
+                };
+                outgoing
+                    .send_server_notification(ServerNotification::ItemStarted(notification))
+                    .await;
                 let params = DynamicToolCallParams {
                     thread_id: conversation_id.to_string(),
-                    turn_id: request.turn_id,
+                    turn_id: turn_id.clone(),
                     call_id: call_id.clone(),
-                    tool: request.tool,
-                    arguments: request.arguments,
+                    tool: tool.clone(),
+                    arguments: arguments.clone(),
                 };
-                let rx = outgoing
+                let (_pending_request_id, rx) = outgoing
                     .send_request(ServerRequestPayload::DynamicToolCall(params))
                     .await;
                 tokio::spawn(async move {
@@ -540,6 +823,46 @@ pub(crate) async fn apply_bespoke_event_handling(
                             success: false,
                         },
                     })
+                    .await;
+            }
+        }
+        EventMsg::DynamicToolCallResponse(response) => {
+            if matches!(api_version, ApiVersion::V2) {
+                let status = if response.success {
+                    DynamicToolCallStatus::Completed
+                } else {
+                    DynamicToolCallStatus::Failed
+                };
+                let duration_ms = i64::try_from(response.duration.as_millis()).ok();
+                let item = ThreadItem::DynamicToolCall {
+                    id: response.call_id,
+                    tool: response.tool,
+                    arguments: response.arguments,
+                    status,
+                    content_items: Some(
+                        response
+                            .content_items
+                            .into_iter()
+                            .map(|item| match item {
+                                CoreDynamicToolCallOutputContentItem::InputText { text } => {
+                                    DynamicToolCallOutputContentItem::InputText { text }
+                                }
+                                CoreDynamicToolCallOutputContentItem::InputImage { image_url } => {
+                                    DynamicToolCallOutputContentItem::InputImage { image_url }
+                                }
+                            })
+                            .collect(),
+                    ),
+                    success: Some(response.success),
+                    duration_ms,
+                };
+                let notification = ItemCompletedNotification {
+                    thread_id: conversation_id.to_string(),
+                    turn_id: response.turn_id,
+                    item,
+                };
+                outgoing
+                    .send_server_notification(ServerNotification::ItemCompleted(notification))
                     .await;
             }
         }
@@ -574,6 +897,8 @@ pub(crate) async fn apply_bespoke_event_handling(
                 sender_thread_id: begin_event.sender_thread_id.to_string(),
                 receiver_thread_ids: Vec::new(),
                 prompt: Some(begin_event.prompt),
+                model: Some(begin_event.model),
+                reasoning_effort: Some(begin_event.reasoning_effort),
                 agents_states: HashMap::new(),
             };
             let notification = ItemStartedNotification {
@@ -611,6 +936,8 @@ pub(crate) async fn apply_bespoke_event_handling(
                 sender_thread_id: end_event.sender_thread_id.to_string(),
                 receiver_thread_ids,
                 prompt: Some(end_event.prompt),
+                model: Some(end_event.model),
+                reasoning_effort: Some(end_event.reasoning_effort),
                 agents_states,
             };
             let notification = ItemCompletedNotification {
@@ -631,6 +958,8 @@ pub(crate) async fn apply_bespoke_event_handling(
                 sender_thread_id: begin_event.sender_thread_id.to_string(),
                 receiver_thread_ids,
                 prompt: Some(begin_event.prompt),
+                model: None,
+                reasoning_effort: None,
                 agents_states: HashMap::new(),
             };
             let notification = ItemStartedNotification {
@@ -657,6 +986,8 @@ pub(crate) async fn apply_bespoke_event_handling(
                 sender_thread_id: end_event.sender_thread_id.to_string(),
                 receiver_thread_ids: vec![receiver_id.clone()],
                 prompt: Some(end_event.prompt),
+                model: None,
+                reasoning_effort: None,
                 agents_states: [(receiver_id, received_status)].into_iter().collect(),
             };
             let notification = ItemCompletedNotification {
@@ -681,6 +1012,8 @@ pub(crate) async fn apply_bespoke_event_handling(
                 sender_thread_id: begin_event.sender_thread_id.to_string(),
                 receiver_thread_ids,
                 prompt: None,
+                model: None,
+                reasoning_effort: None,
                 agents_states: HashMap::new(),
             };
             let notification = ItemStartedNotification {
@@ -717,6 +1050,8 @@ pub(crate) async fn apply_bespoke_event_handling(
                 sender_thread_id: end_event.sender_thread_id.to_string(),
                 receiver_thread_ids,
                 prompt: None,
+                model: None,
+                reasoning_effort: None,
                 agents_states,
             };
             let notification = ItemCompletedNotification {
@@ -736,6 +1071,8 @@ pub(crate) async fn apply_bespoke_event_handling(
                 sender_thread_id: begin_event.sender_thread_id.to_string(),
                 receiver_thread_ids: vec![begin_event.receiver_thread_id.to_string()],
                 prompt: None,
+                model: None,
+                reasoning_effort: None,
                 agents_states: HashMap::new(),
             };
             let notification = ItemStartedNotification {
@@ -776,6 +1113,8 @@ pub(crate) async fn apply_bespoke_event_handling(
                 sender_thread_id: end_event.sender_thread_id.to_string(),
                 receiver_thread_ids: vec![receiver_id],
                 prompt: None,
+                model: None,
+                reasoning_effort: None,
                 agents_states,
             };
             let notification = ItemCompletedNotification {
@@ -1024,6 +1363,30 @@ pub(crate) async fn apply_bespoke_event_handling(
                 .send_server_notification(ServerNotification::ItemCompleted(notification))
                 .await;
         }
+        EventMsg::HookStarted(event) => {
+            if let ApiVersion::V2 = api_version {
+                let notification = HookStartedNotification {
+                    thread_id: conversation_id.to_string(),
+                    turn_id: event.turn_id,
+                    run: event.run.into(),
+                };
+                outgoing
+                    .send_server_notification(ServerNotification::HookStarted(notification))
+                    .await;
+            }
+        }
+        EventMsg::HookCompleted(event) => {
+            if let ApiVersion::V2 = api_version {
+                let notification = HookCompletedNotification {
+                    thread_id: conversation_id.to_string(),
+                    turn_id: event.turn_id,
+                    run: event.run.into(),
+                };
+                outgoing
+                    .send_server_notification(ServerNotification::HookCompleted(notification))
+                    .await;
+            }
+        }
         EventMsg::ExitedReviewMode(review_event) => {
             let review = match review_event.review_output {
                 Some(output) => render_review_output_text(&output),
@@ -1064,6 +1427,7 @@ pub(crate) async fn apply_bespoke_event_handling(
             // Until we migrate the core to be aware of a first class FileChangeItem
             // and emit the corresponding EventMsg, we repurpose the call_id as the item_id.
             let item_id = patch_begin_event.call_id.clone();
+            let changes = convert_patch_changes(&patch_begin_event.changes);
 
             let first_start = {
                 let mut state = thread_state.lock().await;
@@ -1075,7 +1439,7 @@ pub(crate) async fn apply_bespoke_event_handling(
             if first_start {
                 let item = ThreadItem::FileChange {
                     id: item_id.clone(),
-                    changes: convert_patch_changes(&patch_begin_event.changes),
+                    changes,
                     status: PatchApplyStatus::InProgress,
                 };
                 let notification = ItemStartedNotification {
@@ -1257,6 +1621,8 @@ pub(crate) async fn apply_bespoke_event_handling(
         }
         // If this is a TurnAborted, reply to any pending interrupt requests.
         EventMsg::TurnAborted(turn_aborted_event) => {
+            // All per-thread requests are bound to a turn, so abort them.
+            outgoing.abort_pending_server_requests().await;
             let pending = {
                 let mut state = thread_state.lock().await;
                 std::mem::take(&mut state.pending_interrupts)
@@ -1363,7 +1729,9 @@ pub(crate) async fn apply_bespoke_event_handling(
                     thread_name: thread_name_event.thread_name,
                 };
                 outgoing
-                    .send_server_notification(ServerNotification::ThreadNameUpdated(notification))
+                    .send_global_server_notification(ServerNotification::ThreadNameUpdated(
+                        notification,
+                    ))
                     .await;
             }
         }
@@ -1653,6 +2021,7 @@ async fn on_patch_approval_response(
     let response = receiver.await;
     let value = match response {
         Ok(Ok(value)) => value,
+        Ok(Err(err)) if is_turn_transition_server_request_error(&err) => return,
         Ok(Err(err)) => {
             error!("request failed with client error: {err:?}");
             if let Err(submit_err) = codex
@@ -1709,6 +2078,7 @@ async fn on_exec_approval_response(
     let response = receiver.await;
     let value = match response {
         Ok(Ok(value)) => value,
+        Ok(Err(err)) if is_turn_transition_server_request_error(&err) => return,
         Ok(Err(err)) => {
             error!("request failed with client error: {err:?}");
             return;
@@ -1744,14 +2114,18 @@ async fn on_exec_approval_response(
 
 async fn on_request_user_input_response(
     event_turn_id: String,
+    pending_request_id: RequestId,
     receiver: oneshot::Receiver<ClientRequestResult>,
     conversation: Arc<CodexThread>,
+    thread_state: Arc<Mutex<ThreadState>>,
     user_input_guard: ThreadWatchActiveGuard,
 ) {
     let response = receiver.await;
+    resolve_server_request_on_thread_listener(&thread_state, pending_request_id).await;
     drop(user_input_guard);
     let value = match response {
         Ok(Ok(value)) => value,
+        Ok(Err(err)) if is_turn_transition_server_request_error(&err) => return,
         Ok(Err(err)) => {
             error!("request failed with client error: {err:?}");
             let empty = CoreRequestUserInputResponse {
@@ -1819,6 +2193,143 @@ async fn on_request_user_input_response(
     }
 }
 
+async fn on_mcp_server_elicitation_response(
+    server_name: String,
+    request_id: codex_protocol::mcp::RequestId,
+    pending_request_id: RequestId,
+    receiver: oneshot::Receiver<ClientRequestResult>,
+    conversation: Arc<CodexThread>,
+    thread_state: Arc<Mutex<ThreadState>>,
+    permission_guard: ThreadWatchActiveGuard,
+) {
+    let response = receiver.await;
+    resolve_server_request_on_thread_listener(&thread_state, pending_request_id).await;
+    drop(permission_guard);
+    let response = mcp_server_elicitation_response_from_client_result(response);
+
+    if let Err(err) = conversation
+        .submit(Op::ResolveElicitation {
+            server_name,
+            request_id,
+            decision: response.action.to_core(),
+            content: response.content,
+            meta: response.meta,
+        })
+        .await
+    {
+        error!("failed to submit ResolveElicitation: {err}");
+    }
+}
+
+fn mcp_server_elicitation_response_from_client_result(
+    response: std::result::Result<ClientRequestResult, oneshot::error::RecvError>,
+) -> McpServerElicitationRequestResponse {
+    match response {
+        Ok(Ok(value)) => serde_json::from_value::<McpServerElicitationRequestResponse>(value)
+            .unwrap_or_else(|err| {
+                error!("failed to deserialize McpServerElicitationRequestResponse: {err}");
+                McpServerElicitationRequestResponse {
+                    action: McpServerElicitationAction::Decline,
+                    content: None,
+                    meta: None,
+                }
+            }),
+        Ok(Err(err)) if is_turn_transition_server_request_error(&err) => {
+            McpServerElicitationRequestResponse {
+                action: McpServerElicitationAction::Cancel,
+                content: None,
+                meta: None,
+            }
+        }
+        Ok(Err(err)) => {
+            error!("request failed with client error: {err:?}");
+            McpServerElicitationRequestResponse {
+                action: McpServerElicitationAction::Decline,
+                content: None,
+                meta: None,
+            }
+        }
+        Err(err) => {
+            error!("request failed: {err:?}");
+            McpServerElicitationRequestResponse {
+                action: McpServerElicitationAction::Decline,
+                content: None,
+                meta: None,
+            }
+        }
+    }
+}
+
+async fn on_request_permissions_response(
+    call_id: String,
+    requested_permissions: CoreRequestPermissionProfile,
+    pending_request_id: RequestId,
+    receiver: oneshot::Receiver<ClientRequestResult>,
+    conversation: Arc<CodexThread>,
+    thread_state: Arc<Mutex<ThreadState>>,
+    request_permissions_guard: ThreadWatchActiveGuard,
+) {
+    let response = receiver.await;
+    resolve_server_request_on_thread_listener(&thread_state, pending_request_id).await;
+    drop(request_permissions_guard);
+    let Some(response) =
+        request_permissions_response_from_client_result(requested_permissions, response)
+    else {
+        return;
+    };
+
+    if let Err(err) = conversation
+        .submit(Op::RequestPermissionsResponse {
+            id: call_id,
+            response,
+        })
+        .await
+    {
+        error!("failed to submit RequestPermissionsResponse: {err}");
+    }
+}
+
+fn request_permissions_response_from_client_result(
+    requested_permissions: CoreRequestPermissionProfile,
+    response: std::result::Result<ClientRequestResult, oneshot::error::RecvError>,
+) -> Option<CoreRequestPermissionsResponse> {
+    let value = match response {
+        Ok(Ok(value)) => value,
+        Ok(Err(err)) if is_turn_transition_server_request_error(&err) => return None,
+        Ok(Err(err)) => {
+            error!("request failed with client error: {err:?}");
+            return Some(CoreRequestPermissionsResponse {
+                permissions: Default::default(),
+                scope: CorePermissionGrantScope::Turn,
+            });
+        }
+        Err(err) => {
+            error!("request failed: {err:?}");
+            return Some(CoreRequestPermissionsResponse {
+                permissions: Default::default(),
+                scope: CorePermissionGrantScope::Turn,
+            });
+        }
+    };
+
+    let response = serde_json::from_value::<PermissionsRequestApprovalResponse>(value)
+        .unwrap_or_else(|err| {
+            error!("failed to deserialize PermissionsRequestApprovalResponse: {err}");
+            PermissionsRequestApprovalResponse {
+                permissions: V2GrantedPermissionProfile::default(),
+                scope: codex_app_server_protocol::PermissionGrantScope::Turn,
+            }
+        });
+    Some(CoreRequestPermissionsResponse {
+        permissions: intersect_permission_profiles(
+            requested_permissions.into(),
+            response.permissions.into(),
+        )
+        .into(),
+        scope: response.scope.to_core(),
+    })
+}
+
 const REVIEW_FALLBACK_MESSAGE: &str = "Reviewer failed to output a response.";
 
 fn render_review_output_text(output: &ReviewOutputEvent) -> String {
@@ -1862,6 +2373,7 @@ async fn on_file_change_request_approval_response(
     conversation_id: ThreadId,
     item_id: String,
     changes: Vec<FileUpdateChange>,
+    pending_request_id: RequestId,
     receiver: oneshot::Receiver<ClientRequestResult>,
     codex: Arc<CodexThread>,
     outgoing: ThreadScopedOutgoingMessageSender,
@@ -1869,6 +2381,7 @@ async fn on_file_change_request_approval_response(
     permission_guard: ThreadWatchActiveGuard,
 ) {
     let response = receiver.await;
+    resolve_server_request_on_thread_listener(&thread_state, pending_request_id).await;
     drop(permission_guard);
     let (decision, completion_status) = match response {
         Ok(Ok(value)) => {
@@ -1886,6 +2399,7 @@ async fn on_file_change_request_approval_response(
             // Only short-circuit on declines/cancels/failures.
             (decision, completion_status)
         }
+        Ok(Err(err)) if is_turn_transition_server_request_error(&err) => return,
         Ok(Err(err)) => {
             error!("request failed with client error: {err:?}");
             (ReviewDecision::Denied, Some(PatchApplyStatus::Failed))
@@ -1927,6 +2441,7 @@ async fn on_command_execution_request_approval_response(
     approval_id: Option<String>,
     item_id: String,
     completion_item: Option<CommandExecutionCompletionItem>,
+    pending_request_id: RequestId,
     receiver: oneshot::Receiver<ClientRequestResult>,
     conversation: Arc<CodexThread>,
     outgoing: ThreadScopedOutgoingMessageSender,
@@ -1934,6 +2449,7 @@ async fn on_command_execution_request_approval_response(
     permission_guard: ThreadWatchActiveGuard,
 ) {
     let response = receiver.await;
+    resolve_server_request_on_thread_listener(&thread_state, pending_request_id).await;
     drop(permission_guard);
     let (decision, completion_status) = match response {
         Ok(Ok(value)) => {
@@ -1985,6 +2501,7 @@ async fn on_command_execution_request_approval_response(
             };
             (decision, completion_status)
         }
+        Ok(Err(err)) if is_turn_transition_server_request_error(&err) => return,
         Ok(Err(err)) => {
             error!("request failed with client error: {err:?}");
             (ReviewDecision::Denied, Some(CommandExecutionStatus::Failed))
@@ -2050,6 +2567,8 @@ fn collab_resume_begin_item(
         sender_thread_id: begin_event.sender_thread_id.to_string(),
         receiver_thread_ids: vec![begin_event.receiver_thread_id.to_string()],
         prompt: None,
+        model: None,
+        reasoning_effort: None,
         agents_states: HashMap::new(),
     }
 }
@@ -2074,6 +2593,8 @@ fn collab_resume_end_item(end_event: codex_protocol::protocol::CollabResumeEndEv
         sender_thread_id: end_event.sender_thread_id.to_string(),
         receiver_thread_ids: vec![receiver_id],
         prompt: None,
+        model: None,
+        reasoning_effort: None,
         agents_states,
     }
 }
@@ -2158,8 +2679,11 @@ mod tests {
     use anyhow::Result;
     use anyhow::anyhow;
     use anyhow::bail;
+    use codex_app_server_protocol::JSONRPCErrorError;
     use codex_app_server_protocol::TurnPlanStepStatus;
     use codex_protocol::mcp::CallToolResult;
+    use codex_protocol::models::FileSystemPermissions as CoreFileSystemPermissions;
+    use codex_protocol::models::NetworkPermissions as CoreNetworkPermissions;
     use codex_protocol::plan_tool::PlanItemArg;
     use codex_protocol::plan_tool::StepStatus;
     use codex_protocol::protocol::CollabResumeBeginEvent;
@@ -2170,6 +2694,7 @@ mod tests {
     use codex_protocol::protocol::RateLimitWindow;
     use codex_protocol::protocol::TokenUsage;
     use codex_protocol::protocol::TokenUsageInfo;
+    use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
     use rmcp::model::Content;
     use serde_json::Value as JsonValue;
@@ -2203,6 +2728,162 @@ mod tests {
     }
 
     #[test]
+    fn mcp_server_elicitation_turn_transition_error_maps_to_cancel() {
+        let error = JSONRPCErrorError {
+            code: -1,
+            message: "client request resolved because the turn state was changed".to_string(),
+            data: Some(serde_json::json!({ "reason": "turnTransition" })),
+        };
+
+        let response = mcp_server_elicitation_response_from_client_result(Ok(Err(error)));
+
+        assert_eq!(
+            response,
+            McpServerElicitationRequestResponse {
+                action: McpServerElicitationAction::Cancel,
+                content: None,
+                meta: None,
+            }
+        );
+    }
+
+    #[test]
+    fn request_permissions_turn_transition_error_is_ignored() {
+        let error = JSONRPCErrorError {
+            code: -1,
+            message: "client request resolved because the turn state was changed".to_string(),
+            data: Some(serde_json::json!({ "reason": "turnTransition" })),
+        };
+
+        let response = request_permissions_response_from_client_result(
+            CoreRequestPermissionProfile::default(),
+            Ok(Err(error)),
+        );
+
+        assert_eq!(response, None);
+    }
+
+    #[test]
+    fn request_permissions_response_accepts_partial_network_and_file_system_grants() {
+        let input_path = if cfg!(target_os = "windows") {
+            r"C:\tmp\input"
+        } else {
+            "/tmp/input"
+        };
+        let output_path = if cfg!(target_os = "windows") {
+            r"C:\tmp\output"
+        } else {
+            "/tmp/output"
+        };
+        let ignored_path = if cfg!(target_os = "windows") {
+            r"C:\tmp\ignored"
+        } else {
+            "/tmp/ignored"
+        };
+        let absolute_path = |path: &str| {
+            AbsolutePathBuf::try_from(std::path::PathBuf::from(path)).expect("absolute path")
+        };
+        let requested_permissions = CoreRequestPermissionProfile {
+            network: Some(CoreNetworkPermissions {
+                enabled: Some(true),
+            }),
+            file_system: Some(CoreFileSystemPermissions {
+                read: Some(vec![absolute_path(input_path)]),
+                write: Some(vec![absolute_path(output_path)]),
+            }),
+        };
+        let cases = vec![
+            (
+                serde_json::json!({}),
+                CoreRequestPermissionProfile::default(),
+            ),
+            (
+                serde_json::json!({
+                    "network": {
+                        "enabled": true,
+                    },
+                }),
+                CoreRequestPermissionProfile {
+                    network: Some(CoreNetworkPermissions {
+                        enabled: Some(true),
+                    }),
+                    ..CoreRequestPermissionProfile::default()
+                },
+            ),
+            (
+                serde_json::json!({
+                    "fileSystem": {
+                        "write": [output_path],
+                    },
+                }),
+                CoreRequestPermissionProfile {
+                    file_system: Some(CoreFileSystemPermissions {
+                        read: None,
+                        write: Some(vec![absolute_path(output_path)]),
+                    }),
+                    ..CoreRequestPermissionProfile::default()
+                },
+            ),
+            (
+                serde_json::json!({
+                    "fileSystem": {
+                        "read": [input_path],
+                        "write": [output_path, ignored_path],
+                    },
+                    "macos": {
+                        "calendar": true,
+                    },
+                }),
+                CoreRequestPermissionProfile {
+                    file_system: Some(CoreFileSystemPermissions {
+                        read: Some(vec![absolute_path(input_path)]),
+                        write: Some(vec![absolute_path(output_path)]),
+                    }),
+                    ..CoreRequestPermissionProfile::default()
+                },
+            ),
+        ];
+
+        for (granted_permissions, expected_permissions) in cases {
+            let response = request_permissions_response_from_client_result(
+                requested_permissions.clone(),
+                Ok(Ok(serde_json::json!({
+                    "permissions": granted_permissions,
+                }))),
+            )
+            .expect("response should be accepted");
+
+            assert_eq!(
+                response,
+                CoreRequestPermissionsResponse {
+                    permissions: expected_permissions,
+                    scope: CorePermissionGrantScope::Turn,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn request_permissions_response_preserves_session_scope() {
+        let response = request_permissions_response_from_client_result(
+            CoreRequestPermissionProfile::default(),
+            Ok(Ok(serde_json::json!({
+                "scope": "session",
+                "permissions": {},
+            }))),
+        )
+        .expect("response should be accepted");
+
+        assert_eq!(
+            response,
+            CoreRequestPermissionsResponse {
+                permissions: CoreRequestPermissionProfile::default(),
+                scope: CorePermissionGrantScope::Session,
+            }
+        );
+    }
+
+    #[test]
     fn collab_resume_begin_maps_to_item_started_resume_agent() {
         let event = CollabResumeBeginEvent {
             call_id: "call-1".to_string(),
@@ -2220,6 +2901,8 @@ mod tests {
             sender_thread_id: event.sender_thread_id.to_string(),
             receiver_thread_ids: vec![event.receiver_thread_id.to_string()],
             prompt: None,
+            model: None,
+            reasoning_effort: None,
             agents_states: HashMap::new(),
         };
         assert_eq!(item, expected);
@@ -2245,6 +2928,8 @@ mod tests {
             sender_thread_id: event.sender_thread_id.to_string(),
             receiver_thread_ids: vec![receiver_id.clone()],
             prompt: None,
+            model: None,
+            reasoning_effort: None,
             agents_states: [(
                 receiver_id,
                 V2CollabAgentStatus::from(codex_protocol::protocol::AgentStatus::NotFound),
@@ -2289,7 +2974,11 @@ mod tests {
         let event_turn_id = "complete1".to_string();
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
         let outgoing = Arc::new(OutgoingMessageSender::new(tx));
-        let outgoing = ThreadScopedOutgoingMessageSender::new(outgoing, vec![ConnectionId(1)]);
+        let outgoing = ThreadScopedOutgoingMessageSender::new(
+            outgoing,
+            vec![ConnectionId(1)],
+            ThreadId::new(),
+        );
         let thread_state = new_thread_state();
 
         handle_turn_complete(
@@ -2330,7 +3019,11 @@ mod tests {
         .await;
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
         let outgoing = Arc::new(OutgoingMessageSender::new(tx));
-        let outgoing = ThreadScopedOutgoingMessageSender::new(outgoing, vec![ConnectionId(1)]);
+        let outgoing = ThreadScopedOutgoingMessageSender::new(
+            outgoing,
+            vec![ConnectionId(1)],
+            ThreadId::new(),
+        );
 
         handle_turn_interrupted(
             conversation_id,
@@ -2370,7 +3063,11 @@ mod tests {
         .await;
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
         let outgoing = Arc::new(OutgoingMessageSender::new(tx));
-        let outgoing = ThreadScopedOutgoingMessageSender::new(outgoing, vec![ConnectionId(1)]);
+        let outgoing = ThreadScopedOutgoingMessageSender::new(
+            outgoing,
+            vec![ConnectionId(1)],
+            ThreadId::new(),
+        );
 
         handle_turn_complete(
             conversation_id,
@@ -2404,7 +3101,11 @@ mod tests {
     async fn test_handle_turn_plan_update_emits_notification_for_v2() -> Result<()> {
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
         let outgoing = Arc::new(OutgoingMessageSender::new(tx));
-        let outgoing = ThreadScopedOutgoingMessageSender::new(outgoing, vec![ConnectionId(1)]);
+        let outgoing = ThreadScopedOutgoingMessageSender::new(
+            outgoing,
+            vec![ConnectionId(1)],
+            ThreadId::new(),
+        );
         let update = UpdatePlanArgs {
             explanation: Some("need plan".to_string()),
             plan: vec![
@@ -2454,7 +3155,11 @@ mod tests {
         let turn_id = "turn-123".to_string();
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
         let outgoing = Arc::new(OutgoingMessageSender::new(tx));
-        let outgoing = ThreadScopedOutgoingMessageSender::new(outgoing, vec![ConnectionId(1)]);
+        let outgoing = ThreadScopedOutgoingMessageSender::new(
+            outgoing,
+            vec![ConnectionId(1)],
+            ThreadId::new(),
+        );
 
         let info = TokenUsageInfo {
             total_token_usage: TokenUsage {
@@ -2538,7 +3243,11 @@ mod tests {
         let turn_id = "turn-456".to_string();
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
         let outgoing = Arc::new(OutgoingMessageSender::new(tx));
-        let outgoing = ThreadScopedOutgoingMessageSender::new(outgoing, vec![ConnectionId(1)]);
+        let outgoing = ThreadScopedOutgoingMessageSender::new(
+            outgoing,
+            vec![ConnectionId(1)],
+            ThreadId::new(),
+        );
 
         handle_token_count_event(
             conversation_id,
@@ -2605,7 +3314,11 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
         let outgoing = Arc::new(OutgoingMessageSender::new(tx));
-        let outgoing = ThreadScopedOutgoingMessageSender::new(outgoing, vec![ConnectionId(1)]);
+        let outgoing = ThreadScopedOutgoingMessageSender::new(
+            outgoing,
+            vec![ConnectionId(1)],
+            ThreadId::new(),
+        );
 
         // Turn 1 on conversation A
         let a_turn1 = "a_turn1".to_string();
@@ -2828,7 +3541,11 @@ mod tests {
     async fn test_handle_turn_diff_emits_v2_notification() -> Result<()> {
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
         let outgoing = Arc::new(OutgoingMessageSender::new(tx));
-        let outgoing = ThreadScopedOutgoingMessageSender::new(outgoing, vec![ConnectionId(1)]);
+        let outgoing = ThreadScopedOutgoingMessageSender::new(
+            outgoing,
+            vec![ConnectionId(1)],
+            ThreadId::new(),
+        );
         let unified_diff = "--- a\n+++ b\n".to_string();
         let conversation_id = ThreadId::new();
 
@@ -2862,7 +3579,11 @@ mod tests {
     async fn test_handle_turn_diff_is_noop_for_v1() -> Result<()> {
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
         let outgoing = Arc::new(OutgoingMessageSender::new(tx));
-        let outgoing = ThreadScopedOutgoingMessageSender::new(outgoing, vec![ConnectionId(1)]);
+        let outgoing = ThreadScopedOutgoingMessageSender::new(
+            outgoing,
+            vec![ConnectionId(1)],
+            ThreadId::new(),
+        );
         let conversation_id = ThreadId::new();
 
         handle_turn_diff(

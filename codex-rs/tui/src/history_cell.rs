@@ -39,9 +39,12 @@ use crate::wrapping::adaptive_wrap_lines;
 use base64::Engine;
 use codex_core::config::Config;
 use codex_core::config::types::McpServerTransportConfig;
+use codex_core::mcp::McpManager;
+use codex_core::plugins::PluginsManager;
 use codex_core::web_search::web_search_detail;
 use codex_otel::RuntimeMetricsSummary;
 use codex_protocol::account::PlanType;
+use codex_protocol::config_types::ServiceTier;
 use codex_protocol::mcp::Resource;
 use codex_protocol::mcp::ResourceTemplate;
 use codex_protocol::models::WebSearchAction;
@@ -73,6 +76,7 @@ use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 use tracing::error;
@@ -371,14 +375,19 @@ impl HistoryCell for UserHistoryCell {
 pub(crate) struct ReasoningSummaryCell {
     _header: String,
     content: String,
+    /// Session cwd used to render local file links inside the reasoning body.
+    cwd: PathBuf,
     transcript_only: bool,
 }
 
 impl ReasoningSummaryCell {
-    pub(crate) fn new(header: String, content: String, transcript_only: bool) -> Self {
+    /// Create a reasoning summary cell that will render local file links relative to the session
+    /// cwd active when the summary was recorded.
+    pub(crate) fn new(header: String, content: String, cwd: &Path, transcript_only: bool) -> Self {
         Self {
             _header: header,
             content,
+            cwd: cwd.to_path_buf(),
             transcript_only,
         }
     }
@@ -388,6 +397,7 @@ impl ReasoningSummaryCell {
         append_markdown(
             &self.content,
             Some((width as usize).saturating_sub(2)),
+            Some(self.cwd.as_path()),
             &mut lines,
         );
         let summary_style = Style::default().dim().italic();
@@ -993,11 +1003,15 @@ pub(crate) fn padded_emoji(emoji: &str) -> String {
 #[derive(Debug)]
 struct TooltipHistoryCell {
     tip: String,
+    cwd: PathBuf,
 }
 
 impl TooltipHistoryCell {
-    fn new(tip: String) -> Self {
-        Self { tip }
+    fn new(tip: String, cwd: &Path) -> Self {
+        Self {
+            tip,
+            cwd: cwd.to_path_buf(),
+        }
     }
 }
 
@@ -1012,6 +1026,7 @@ impl HistoryCell for TooltipHistoryCell {
         append_markdown(
             &format!("**Tip:** {}", self.tip),
             Some(wrap_width),
+            Some(self.cwd.as_path()),
             &mut lines,
         );
 
@@ -1041,7 +1056,9 @@ pub(crate) fn new_session_info(
     requested_model: &str,
     event: SessionConfiguredEvent,
     is_first_event: bool,
+    tooltip_override: Option<String>,
     auth_plan: Option<PlanType>,
+    show_fast_status: bool,
 ) -> SessionInfoCell {
     let SessionConfiguredEvent {
         model,
@@ -1052,6 +1069,7 @@ pub(crate) fn new_session_info(
     let header = SessionHeaderHistoryCell::new(
         model.clone(),
         reasoning_effort,
+        show_fast_status,
         config.cwd.clone(),
         CODEX_CLI_VERSION,
     );
@@ -1094,7 +1112,14 @@ pub(crate) fn new_session_info(
         parts.push(Box::new(PlainHistoryCell { lines: help_lines }));
     } else {
         if config.show_tooltips
-            && let Some(tooltips) = tooltips::get_tooltip(auth_plan).map(TooltipHistoryCell::new)
+            && let Some(tooltips) = tooltip_override
+                .or_else(|| {
+                    tooltips::get_tooltip(
+                        auth_plan,
+                        matches!(config.service_tier, Some(ServiceTier::Fast)),
+                    )
+                })
+                .map(|tip| TooltipHistoryCell::new(tip, &config.cwd))
         {
             parts.push(Box::new(tooltips));
         }
@@ -1131,6 +1156,7 @@ pub(crate) struct SessionHeaderHistoryCell {
     model: String,
     model_style: Style,
     reasoning_effort: Option<ReasoningEffortConfig>,
+    show_fast_status: bool,
     directory: PathBuf,
 }
 
@@ -1138,6 +1164,7 @@ impl SessionHeaderHistoryCell {
     pub(crate) fn new(
         model: String,
         reasoning_effort: Option<ReasoningEffortConfig>,
+        show_fast_status: bool,
         directory: PathBuf,
         version: &'static str,
     ) -> Self {
@@ -1145,6 +1172,7 @@ impl SessionHeaderHistoryCell {
             model,
             Style::default(),
             reasoning_effort,
+            show_fast_status,
             directory,
             version,
         )
@@ -1154,6 +1182,7 @@ impl SessionHeaderHistoryCell {
         model: String,
         model_style: Style,
         reasoning_effort: Option<ReasoningEffortConfig>,
+        show_fast_status: bool,
         directory: PathBuf,
         version: &'static str,
     ) -> Self {
@@ -1162,6 +1191,7 @@ impl SessionHeaderHistoryCell {
             model,
             model_style,
             reasoning_effort,
+            show_fast_status,
             directory,
         }
     }
@@ -1240,6 +1270,10 @@ impl HistoryCell for SessionHeaderHistoryCell {
             if let Some(reasoning) = reasoning_label {
                 spans.push(Span::from(" "));
                 spans.push(Span::from(reasoning));
+            }
+            if self.show_fast_status {
+                spans.push("   ".into());
+                spans.push(Span::styled("fast", self.model_style.magenta()));
             }
             spans.push("   ".dim());
             spans.push(CHANGE_MODEL_HINT_COMMAND.cyan());
@@ -1710,7 +1744,9 @@ pub(crate) fn new_mcp_tools_output(
         lines.push("".into());
     }
 
-    let mut servers: Vec<_> = config.mcp_servers.iter().collect();
+    let mcp_manager = McpManager::new(Arc::new(PluginsManager::new(config.codex_home.clone())));
+    let effective_servers = mcp_manager.effective_servers(config, None);
+    let mut servers: Vec<_> = effective_servers.iter().collect();
     servers.sort_by(|(a, _), (b, _)| a.cmp(b));
 
     for (server, cfg) in servers {
@@ -2021,8 +2057,12 @@ pub(crate) fn new_plan_update(update: UpdatePlanArgs) -> PlanUpdateCell {
     PlanUpdateCell { explanation, plan }
 }
 
-pub(crate) fn new_proposed_plan(plan_markdown: String) -> ProposedPlanCell {
-    ProposedPlanCell { plan_markdown }
+/// Create a proposed-plan cell that snapshots the session cwd for later markdown rendering.
+pub(crate) fn new_proposed_plan(plan_markdown: String, cwd: &Path) -> ProposedPlanCell {
+    ProposedPlanCell {
+        plan_markdown,
+        cwd: cwd.to_path_buf(),
+    }
 }
 
 pub(crate) fn new_proposed_plan_stream(
@@ -2038,6 +2078,8 @@ pub(crate) fn new_proposed_plan_stream(
 #[derive(Debug)]
 pub(crate) struct ProposedPlanCell {
     plan_markdown: String,
+    /// Session cwd used to keep local file-link display aligned with live streamed plan rendering.
+    cwd: PathBuf,
 }
 
 #[derive(Debug)]
@@ -2056,7 +2098,12 @@ impl HistoryCell for ProposedPlanCell {
         let plan_style = proposed_plan_style();
         let wrap_width = width.saturating_sub(4).max(1) as usize;
         let mut body: Vec<Line<'static>> = Vec::new();
-        append_markdown(&self.plan_markdown, Some(wrap_width), &mut body);
+        append_markdown(
+            &self.plan_markdown,
+            Some(wrap_width),
+            Some(self.cwd.as_path()),
+            &mut body,
+        );
         if body.is_empty() {
             body.push(Line::from("(empty)".dim().italic()));
         }
@@ -2188,7 +2235,33 @@ pub(crate) fn new_view_image_tool_call(path: PathBuf, cwd: &Path) -> PlainHistor
     PlainHistoryCell { lines }
 }
 
-pub(crate) fn new_reasoning_summary_block(full_reasoning_buffer: String) -> Box<dyn HistoryCell> {
+pub(crate) fn new_image_generation_call(
+    call_id: String,
+    revised_prompt: Option<String>,
+    saved_to: Option<String>,
+) -> PlainHistoryCell {
+    let detail = revised_prompt.unwrap_or_else(|| call_id.clone());
+
+    let mut lines: Vec<Line<'static>> = vec![
+        vec!["• ".dim(), "Generated Image:".bold()].into(),
+        vec!["  └ ".dim(), detail.dim()].into(),
+    ];
+    if let Some(saved_to) = saved_to {
+        lines.push(vec!["  └ ".dim(), format!("Saved to: {saved_to}").dim()].into());
+    }
+
+    PlainHistoryCell { lines }
+}
+
+/// Create the reasoning history cell emitted at the end of a reasoning block.
+///
+/// The helper snapshots `cwd` into the returned cell so local file links render the same way they
+/// did while the turn was live, even if rendering happens after other app state has advanced.
+pub(crate) fn new_reasoning_summary_block(
+    full_reasoning_buffer: String,
+    cwd: &Path,
+) -> Box<dyn HistoryCell> {
+    let cwd = cwd.to_path_buf();
     let full_reasoning_buffer = full_reasoning_buffer.trim();
     if let Some(open) = full_reasoning_buffer.find("**") {
         let after_open = &full_reasoning_buffer[(open + 2)..];
@@ -2199,9 +2272,12 @@ pub(crate) fn new_reasoning_summary_block(full_reasoning_buffer: String) -> Box<
             if after_close_idx < full_reasoning_buffer.len() {
                 let header_buffer = full_reasoning_buffer[..after_close_idx].to_string();
                 let summary_buffer = full_reasoning_buffer[after_close_idx..].to_string();
+                // Preserve the session cwd so local file links render the same way in the
+                // collapsed reasoning block as they did while streaming live content.
                 return Box::new(ReasoningSummaryCell::new(
                     header_buffer,
                     summary_buffer,
+                    &cwd,
                     false,
                 ));
             }
@@ -2210,6 +2286,7 @@ pub(crate) fn new_reasoning_summary_block(full_reasoning_buffer: String) -> Box<
     Box::new(ReasoningSummaryCell::new(
         "".to_string(),
         full_reasoning_buffer.to_string(),
+        &cwd,
         true,
     ))
 }
@@ -2396,13 +2473,19 @@ mod tests {
     use codex_core::config::types::McpServerTransportConfig;
     use codex_otel::RuntimeMetricTotals;
     use codex_otel::RuntimeMetricsSummary;
+    use codex_protocol::ThreadId;
+    use codex_protocol::account::PlanType;
     use codex_protocol::models::WebSearchAction;
     use codex_protocol::parse_command::ParsedCommand;
+    use codex_protocol::protocol::AskForApproval;
     use codex_protocol::protocol::McpAuthStatus;
+    use codex_protocol::protocol::SandboxPolicy;
+    use codex_protocol::protocol::SessionConfiguredEvent;
     use dirs::home_dir;
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use std::collections::HashMap;
+    use std::path::PathBuf;
 
     use codex_protocol::mcp::CallToolResult;
     use codex_protocol::mcp::Tool;
@@ -2417,6 +2500,12 @@ mod tests {
             .build()
             .await
             .expect("config")
+    }
+
+    fn test_cwd() -> PathBuf {
+        // These tests only need a stable absolute cwd; using temp_dir() avoids baking Unix- or
+        // Windows-specific root semantics into the fixtures.
+        std::env::temp_dir()
     }
 
     fn render_lines(lines: &[Line<'static>]) -> Vec<String> {
@@ -2461,6 +2550,26 @@ mod tests {
             meta: None,
         }))
         .expect("resource link content should serialize")
+    }
+
+    fn session_configured_event(model: &str) -> SessionConfiguredEvent {
+        SessionConfiguredEvent {
+            session_id: ThreadId::new(),
+            forked_from_id: None,
+            thread_name: None,
+            model: model.to_string(),
+            model_provider_id: "test-provider".to_string(),
+            service_tier: None,
+            approval_policy: AskForApproval::Never,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            cwd: PathBuf::from("/tmp/project"),
+            reasoning_effort: None,
+            history_log_id: 0,
+            history_entry_count: 0,
+            initial_messages: None,
+            network_proxy: None,
+            rollout_path: Some(PathBuf::new()),
+        }
     }
 
     #[test]
@@ -2514,6 +2623,8 @@ mod tests {
             responses_api_engine_service_ttft_ms: 460,
             responses_api_engine_iapi_tbt_ms: 1_180,
             responses_api_engine_service_tbt_ms: 1_240,
+            turn_ttft_ms: 0,
+            turn_ttfm_ms: 0,
         };
         let cell = FinalMessageSeparator::new(Some(12), Some(summary));
         let rendered = render_lines(&cell.display_lines(600));
@@ -2545,6 +2656,77 @@ mod tests {
         let cell = new_unified_exec_processes_output(Vec::new());
         let rendered = render_lines(&cell.display_lines(60)).join("\n");
         insta::assert_snapshot!(rendered);
+    }
+
+    #[tokio::test]
+    async fn session_info_uses_availability_nux_tooltip_override() {
+        let config = test_config().await;
+        let cell = new_session_info(
+            &config,
+            "gpt-5",
+            session_configured_event("gpt-5"),
+            false,
+            Some("Model just became available".to_string()),
+            Some(PlanType::Free),
+            false,
+        );
+
+        let rendered = render_transcript(&cell).join("\n");
+        assert!(rendered.contains("Model just became available"));
+    }
+
+    #[tokio::test]
+    async fn session_info_availability_nux_tooltip_snapshot() {
+        let mut config = test_config().await;
+        config.cwd = PathBuf::from("/tmp/project");
+        let cell = new_session_info(
+            &config,
+            "gpt-5",
+            session_configured_event("gpt-5"),
+            false,
+            Some("Model just became available".to_string()),
+            Some(PlanType::Free),
+            false,
+        );
+
+        let rendered = render_transcript(&cell).join("\n");
+        insta::assert_snapshot!(rendered);
+    }
+
+    #[tokio::test]
+    async fn session_info_first_event_suppresses_tooltips_and_nux() {
+        let config = test_config().await;
+        let cell = new_session_info(
+            &config,
+            "gpt-5",
+            session_configured_event("gpt-5"),
+            true,
+            Some("Model just became available".to_string()),
+            Some(PlanType::Free),
+            false,
+        );
+
+        let rendered = render_transcript(&cell).join("\n");
+        assert!(!rendered.contains("Model just became available"));
+        assert!(rendered.contains("To get started"));
+    }
+
+    #[tokio::test]
+    async fn session_info_hides_tooltips_when_disabled() {
+        let mut config = test_config().await;
+        config.show_tooltips = false;
+        let cell = new_session_info(
+            &config,
+            "gpt-5",
+            session_configured_event("gpt-5"),
+            false,
+            Some("Model just became available".to_string()),
+            Some(PlanType::Free),
+            false,
+        );
+
+        let rendered = render_transcript(&cell).join("\n");
+        assert!(!rendered.contains("Model just became available"));
     }
 
     #[test]
@@ -2602,6 +2784,16 @@ mod tests {
         insta::assert_snapshot!(rendered);
     }
 
+    #[test]
+    fn error_event_oversized_input_snapshot() {
+        let cell = new_error_event(
+            "Message exceeds the maximum length of 1048576 characters (1048577 provided)."
+                .to_string(),
+        );
+        let rendered = render_lines(&cell.display_lines(120)).join("\n");
+        insta::assert_snapshot!(rendered);
+    }
+
     #[tokio::test]
     async fn mcp_tools_output_masks_sensitive_values() {
         let mut config = test_config().await;
@@ -2623,6 +2815,7 @@ mod tests {
             enabled_tools: None,
             disabled_tools: None,
             scopes: None,
+            oauth_resource: None,
         };
         let mut servers = config.mcp_servers.get().clone();
         servers.insert("docs".to_string(), stdio_config);
@@ -2646,6 +2839,7 @@ mod tests {
             enabled_tools: None,
             disabled_tools: None,
             scopes: None,
+            oauth_resource: None,
         };
         servers.insert("http".to_string(), http_config);
         config
@@ -3161,18 +3355,39 @@ mod tests {
         let cell = SessionHeaderHistoryCell::new(
             "gpt-4o".to_string(),
             Some(ReasoningEffortConfig::High),
+            true,
             std::env::temp_dir(),
             "test",
         );
 
         let lines = render_lines(&cell.display_lines(80));
         let model_line = lines
-            .into_iter()
+            .iter()
+            .find(|line| line.contains("model:"))
+            .expect("model line");
+
+        assert!(model_line.contains("gpt-4o high   fast"));
+        assert!(model_line.contains("/model to change"));
+    }
+
+    #[test]
+    fn session_header_hides_fast_status_when_disabled() {
+        let cell = SessionHeaderHistoryCell::new(
+            "gpt-4o".to_string(),
+            Some(ReasoningEffortConfig::High),
+            false,
+            std::env::temp_dir(),
+            "test",
+        );
+
+        let lines = render_lines(&cell.display_lines(80));
+        let model_line = lines
+            .iter()
             .find(|line| line.contains("model:"))
             .expect("model line");
 
         assert!(model_line.contains("gpt-4o high"));
-        assert!(model_line.contains("/model to change"));
+        assert!(!model_line.contains("fast"));
     }
 
     #[test]
@@ -3824,6 +4039,7 @@ mod tests {
     fn reasoning_summary_block() {
         let cell = new_reasoning_summary_block(
             "**High level reasoning**\n\nDetailed reasoning goes here.".to_string(),
+            &test_cwd(),
         );
 
         let rendered_display = render_lines(&cell.display_lines(80));
@@ -3839,6 +4055,7 @@ mod tests {
         let cell: Box<dyn HistoryCell> = Box::new(ReasoningSummaryCell::new(
             "High level reasoning".to_string(),
             summary.to_string(),
+            &test_cwd(),
             false,
         ));
         let width: u16 = 24;
@@ -3879,7 +4096,8 @@ mod tests {
 
     #[test]
     fn reasoning_summary_block_returns_reasoning_cell_when_feature_disabled() {
-        let cell = new_reasoning_summary_block("Detailed reasoning goes here.".to_string());
+        let cell =
+            new_reasoning_summary_block("Detailed reasoning goes here.".to_string(), &test_cwd());
 
         let rendered = render_transcript(cell.as_ref());
         assert_eq!(rendered, vec!["• Detailed reasoning goes here."]);
@@ -3892,6 +4110,7 @@ mod tests {
         config.model_supports_reasoning_summaries = Some(true);
         let cell = new_reasoning_summary_block(
             "**High level reasoning**\n\nDetailed reasoning goes here.".to_string(),
+            &test_cwd(),
         );
 
         let rendered_display = render_lines(&cell.display_lines(80));
@@ -3900,8 +4119,10 @@ mod tests {
 
     #[test]
     fn reasoning_summary_block_falls_back_when_header_is_missing() {
-        let cell =
-            new_reasoning_summary_block("**High level reasoning without closing".to_string());
+        let cell = new_reasoning_summary_block(
+            "**High level reasoning without closing".to_string(),
+            &test_cwd(),
+        );
 
         let rendered = render_transcript(cell.as_ref());
         assert_eq!(rendered, vec!["• **High level reasoning without closing"]);
@@ -3909,14 +4130,17 @@ mod tests {
 
     #[test]
     fn reasoning_summary_block_falls_back_when_summary_is_missing() {
-        let cell =
-            new_reasoning_summary_block("**High level reasoning without closing**".to_string());
+        let cell = new_reasoning_summary_block(
+            "**High level reasoning without closing**".to_string(),
+            &test_cwd(),
+        );
 
         let rendered = render_transcript(cell.as_ref());
         assert_eq!(rendered, vec!["• High level reasoning without closing"]);
 
         let cell = new_reasoning_summary_block(
             "**High level reasoning without closing**\n\n  ".to_string(),
+            &test_cwd(),
         );
 
         let rendered = render_transcript(cell.as_ref());
@@ -3927,6 +4151,7 @@ mod tests {
     fn reasoning_summary_block_splits_header_and_summary_when_present() {
         let cell = new_reasoning_summary_block(
             "**High level plan**\n\nWe should fix the bug next.".to_string(),
+            &test_cwd(),
         );
 
         let rendered_display = render_lines(&cell.display_lines(80));

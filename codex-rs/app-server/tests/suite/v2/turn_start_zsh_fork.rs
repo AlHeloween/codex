@@ -13,6 +13,7 @@ use app_test_support::create_mock_responses_server_sequence;
 use app_test_support::create_mock_responses_server_sequence_unchecked;
 use app_test_support::create_shell_command_sse_response;
 use app_test_support::to_response;
+use codex_app_server_protocol::CommandAction;
 use codex_app_server_protocol::CommandExecutionApprovalDecision;
 use codex_app_server_protocol::CommandExecutionRequestApprovalResponse;
 use codex_app_server_protocol::CommandExecutionStatus;
@@ -53,6 +54,7 @@ async fn turn_start_shell_zsh_fork_executes_command_v2() -> Result<()> {
     std::fs::create_dir(&codex_home)?;
     let workspace = tmp.path().join("workspace");
     std::fs::create_dir(&workspace)?;
+    let release_marker = workspace.join("interrupt-release");
 
     let Some(zsh_path) = find_test_zsh_path()? else {
         eprintln!("skipping zsh fork test: no zsh executable found");
@@ -60,13 +62,29 @@ async fn turn_start_shell_zsh_fork_executes_command_v2() -> Result<()> {
     };
     eprintln!("using zsh path for zsh-fork test: {}", zsh_path.display());
 
-    let responses = vec![create_shell_command_sse_response(
-        vec!["echo".to_string(), "hi".to_string()],
+    // Keep the shell command in flight until we interrupt it. A fast command
+    // like `echo hi` can finish before the interrupt arrives on faster runners,
+    // which turns this into a test for post-command follow-up behavior instead
+    // of interrupting an active zsh-fork command.
+    let release_marker_escaped = release_marker.to_string_lossy().replace('\'', r#"'\''"#);
+    let wait_for_interrupt =
+        format!("while [ ! -f '{release_marker_escaped}' ]; do sleep 0.01; done");
+    let response = create_shell_command_sse_response(
+        vec!["/bin/sh".to_string(), "-c".to_string(), wait_for_interrupt],
         None,
         Some(5000),
         "call-zsh-fork",
-    )?];
-    let server = create_mock_responses_server_sequence(responses).await;
+    )?;
+    let no_op_response = responses::sse(vec![
+        responses::ev_response_created("resp-2"),
+        responses::ev_completed("resp-2"),
+    ]);
+    // Interrupting after the shell item starts can race with the follow-up
+    // model request that reports the aborted tool call. This test only cares
+    // that zsh-fork launches the expected command, so allow one extra no-op
+    // `/responses` POST instead of asserting an exact request count.
+    let server =
+        create_mock_responses_server_sequence_unchecked(vec![response, no_op_response]).await;
     create_config_toml(
         &codex_home,
         &server.uri(),
@@ -145,7 +163,9 @@ async fn turn_start_shell_zsh_fork_executes_command_v2() -> Result<()> {
     assert_eq!(id, "call-zsh-fork");
     assert_eq!(status, CommandExecutionStatus::InProgress);
     assert!(command.starts_with(&zsh_path.display().to_string()));
-    assert!(command.contains(" -lc 'echo hi'"));
+    assert!(command.contains("/bin/sh -c"));
+    assert!(command.contains("sleep 0.01"));
+    assert!(command.contains(&release_marker.display().to_string()));
     assert_eq!(cwd, workspace);
 
     mcp.interrupt_turn_and_wait_for_aborted(thread.id, turn.id, DEFAULT_READ_TIMEOUT)
@@ -283,7 +303,7 @@ async fn turn_start_shell_zsh_fork_exec_approval_decline_v2() -> Result<()> {
 
     timeout(
         DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_notification_message("codex/event/task_complete"),
+        mcp.read_stream_until_notification_message("turn/completed"),
     )
     .await??;
 
@@ -542,7 +562,10 @@ async fn turn_start_shell_zsh_fork_subcommand_decline_marks_parent_declined_v2()
         CommandExecutionApprovalDecision::Cancel,
     ];
     let mut target_decision_index = 0;
-    while target_decision_index < target_decisions.len() {
+    let first_file_str = first_file.to_string_lossy().into_owned();
+    let second_file_str = second_file.to_string_lossy().into_owned();
+    let parent_shell_hint = format!("&& {}", &first_file_str);
+    while target_decision_index < target_decisions.len() || !saw_parent_approval {
         let server_req = timeout(
             DEFAULT_READ_TIMEOUT,
             mcp.read_stream_until_request_message(),
@@ -558,16 +581,21 @@ async fn turn_start_shell_zsh_fork_subcommand_decline_marks_parent_declined_v2()
             .command
             .as_deref()
             .expect("approval command should be present");
-        let is_target_subcommand = (approval_command.starts_with("/bin/rm ")
-            || approval_command.starts_with("/usr/bin/rm "))
-            && (approval_command.contains(&first_file.display().to_string())
-                || approval_command.contains(&second_file.display().to_string()));
+        let has_first_file = approval_command.contains(&first_file_str);
+        let has_second_file = approval_command.contains(&second_file_str);
+        let mentions_rm_binary =
+            approval_command.contains("/bin/rm ") || approval_command.contains("/usr/bin/rm ");
+        let has_rm_action = params.command_actions.as_ref().is_some_and(|actions| {
+            actions.iter().any(|action| match action {
+                CommandAction::Read { name, .. } => name == "rm",
+                CommandAction::Unknown { command } => command.contains("rm"),
+                _ => false,
+            })
+        });
+        let is_target_subcommand =
+            (has_first_file != has_second_file) && (has_rm_action || mentions_rm_binary);
+
         if is_target_subcommand {
-            assert!(
-                approval_command.contains(&first_file.display().to_string())
-                    || approval_command.contains(&second_file.display().to_string()),
-                "expected zsh subcommand approval for one of the rm commands, got: {approval_command}"
-            );
             approved_subcommand_ids.push(
                 params
                     .approval_id
@@ -577,7 +605,9 @@ async fn turn_start_shell_zsh_fork_subcommand_decline_marks_parent_declined_v2()
             approved_subcommand_strings.push(approval_command.to_string());
         }
         let is_parent_approval = approval_command.contains(&zsh_path.display().to_string())
-            && approval_command.contains(&shell_command);
+            && (approval_command.contains(&shell_command)
+                || (has_first_file && has_second_file)
+                || approval_command.contains(&parent_shell_hint));
         let decision = if is_target_subcommand {
             let decision = target_decisions[target_decision_index].clone();
             target_decision_index += 1;
@@ -643,22 +673,50 @@ async fn turn_start_shell_zsh_fork_subcommand_decline_marks_parent_declined_v2()
             };
             assert_eq!(id, "call-zsh-fork-subcommand-decline");
             assert_eq!(status, CommandExecutionStatus::Declined);
-            assert!(
-                aggregated_output.is_none()
-                    || aggregated_output == Some("exec command rejected by user".to_string())
-            );
+            if let Some(output) = aggregated_output.as_deref() {
+                assert!(
+                    output == "exec command rejected by user"
+                        || output.contains("sandbox denied exec error"),
+                    "unexpected aggregated output: {output}"
+                );
+            }
 
-            mcp.interrupt_turn_and_wait_for_aborted(
-                thread.id.clone(),
-                turn.id.clone(),
+            match timeout(
                 DEFAULT_READ_TIMEOUT,
+                mcp.read_stream_until_notification_message("turn/completed"),
             )
-            .await?;
+            .await
+            {
+                Ok(Ok(completed_notif)) => {
+                    let completed: TurnCompletedNotification = serde_json::from_value(
+                        completed_notif
+                            .params
+                            .expect("turn/completed params must be present"),
+                    )?;
+                    assert_eq!(completed.thread_id, thread.id);
+                    assert_eq!(completed.turn.id, turn.id);
+                    assert!(matches!(
+                        completed.turn.status,
+                        TurnStatus::Interrupted | TurnStatus::Completed
+                    ));
+                }
+                Ok(Err(error)) => return Err(error),
+                Err(_) => {
+                    mcp.interrupt_turn_and_wait_for_aborted(
+                        thread.id.clone(),
+                        turn.id.clone(),
+                        DEFAULT_READ_TIMEOUT,
+                    )
+                    .await?;
+                }
+            }
         }
         Ok(Err(error)) => return Err(error),
         Err(_) => {
             // Some zsh builds abort the turn immediately after the rejected
-            // subcommand without emitting a parent `item/completed`.
+            // subcommand without emitting a parent `item/completed`, and Linux
+            // sandbox failures can also complete the turn before the parent
+            // completion item is observed.
             let completed_notif = timeout(
                 DEFAULT_READ_TIMEOUT,
                 mcp.read_stream_until_notification_message("turn/completed"),
@@ -671,7 +729,10 @@ async fn turn_start_shell_zsh_fork_subcommand_decline_marks_parent_declined_v2()
             )?;
             assert_eq!(completed.thread_id, thread.id);
             assert_eq!(completed.turn.id, turn.id);
-            assert_eq!(completed.turn.status, TurnStatus::Interrupted);
+            assert!(matches!(
+                completed.turn.status,
+                TurnStatus::Interrupted | TurnStatus::Completed
+            ));
         }
     }
 

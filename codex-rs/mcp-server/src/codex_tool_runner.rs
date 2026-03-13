@@ -115,6 +115,7 @@ pub async fn run_codex_tool_session(
             }],
             final_output_json_schema: None,
         },
+        trace: None,
     };
 
     if let Err(e) = thread.submit_with_id(submission).await {
@@ -227,6 +228,8 @@ async fn run_codex_tool_session_inner(
                             parsed_cmd,
                             network_approval_context: _,
                             additional_permissions: _,
+                            skill_metadata: _,
+                            available_decisions: _,
                         } = ev;
                         handle_exec_approval_request(
                             command,
@@ -350,10 +353,14 @@ async fn run_codex_tool_session_inner(
                     | EventMsg::UserMessage(_)
                     | EventMsg::ShutdownComplete
                     | EventMsg::ViewImageToolCall(_)
+                    | EventMsg::ImageGenerationBegin(_)
+                    | EventMsg::ImageGenerationEnd(_)
                     | EventMsg::RawResponseItem(_)
                     | EventMsg::EnteredReviewMode(_)
                     | EventMsg::ItemStarted(_)
                     | EventMsg::ItemCompleted(_)
+                    | EventMsg::HookStarted(_)
+                    | EventMsg::HookCompleted(_)
                     | EventMsg::AgentMessageContentDelta(_)
                     | EventMsg::ReasoningContentDelta(_)
                     | EventMsg::ReasoningRawContentDelta(_)
@@ -362,8 +369,9 @@ async fn run_codex_tool_session_inner(
                     | EventMsg::UndoCompleted(_)
                     | EventMsg::ExitedReviewMode(_)
                     | EventMsg::RequestUserInput(_)
+                    | EventMsg::RequestPermissions(_)
                     | EventMsg::DynamicToolCallRequest(_)
-                    | EventMsg::SkillRequestApproval(_)
+                    | EventMsg::DynamicToolCallResponse(_)
                     | EventMsg::ContextCompacted(_)
                     | EventMsg::ModelReroute(_)
                     | EventMsg::ThreadRolledBack(_)

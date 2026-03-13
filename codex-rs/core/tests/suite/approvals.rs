@@ -13,7 +13,6 @@ use codex_core::sandboxing::SandboxPermissions;
 use codex_protocol::approvals::NetworkApprovalProtocol;
 use codex_protocol::approvals::NetworkPolicyAmendment;
 use codex_protocol::approvals::NetworkPolicyRuleAction;
-use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
@@ -36,6 +35,9 @@ use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use core_test_support::wait_for_event_with_timeout;
+use core_test_support::zsh_fork::build_zsh_fork_test;
+use core_test_support::zsh_fork::restrictive_workspace_write_policy;
+use core_test_support::zsh_fork::zsh_fork_runtime;
 use pretty_assertions::assert_eq;
 use regex_lite::Regex;
 use serde_json::Value;
@@ -237,7 +239,7 @@ fn shell_event_with_prefix_rule(
         "command": command,
         "timeout_ms": timeout_ms,
     });
-    if sandbox_permissions.requires_additional_permissions() {
+    if sandbox_permissions.requests_sandbox_override() {
         args["sandbox_permissions"] = json!(sandbox_permissions);
     }
     if let Some(prefix_rule) = prefix_rule {
@@ -260,7 +262,7 @@ fn exec_command_event(
     if let Some(yield_time_ms) = yield_time_ms {
         args["yield_time_ms"] = json!(yield_time_ms);
     }
-    if sandbox_permissions.requires_additional_permissions() {
+    if sandbox_permissions.requests_sandbox_override() {
         args["sandbox_permissions"] = json!(sandbox_permissions);
         let reason = justification.unwrap_or(DEFAULT_UNIFIED_EXEC_JUSTIFICATION);
         args["justification"] = json!(reason);
@@ -551,7 +553,8 @@ async fn submit_turn(
             sandbox_policy,
             model: session_model,
             effort: None,
-            summary: ReasoningSummary::Auto,
+            summary: None,
+            service_tier: None,
             collaboration_mode: None,
             personality: None,
         })
@@ -1318,7 +1321,7 @@ fn scenarios() -> Vec<ScenarioSpec> {
             expectation: Expectation::FileNotCreated {
                 target: TargetPath::Workspace("ro_never.txt"),
                 message_contains: if cfg!(target_os = "linux") {
-                    &["Permission denied"]
+                    &["Permission denied|Read-only file system"]
                 } else {
                     &[
                         "Permission denied|Operation not permitted|operation not permitted|\
@@ -1465,7 +1468,7 @@ fn scenarios() -> Vec<ScenarioSpec> {
             expectation: Expectation::FileNotCreated {
                 target: TargetPath::OutsideWorkspace("ww_never.txt"),
                 message_contains: if cfg!(target_os = "linux") {
-                    &["Permission denied"]
+                    &["Permission denied|Read-only file system"]
                 } else {
                     &[
                         "Permission denied|Operation not permitted|operation not permitted|\
@@ -1595,7 +1598,10 @@ async fn run_scenario(scenario: &ScenarioSpec) -> Result<()> {
         config.permissions.approval_policy = Constrained::allow_any(approval_policy);
         config.permissions.sandbox_policy = Constrained::allow_any(sandbox_policy.clone());
         for feature in features {
-            config.features.enable(feature);
+            config
+                .features
+                .enable(feature)
+                .expect("test config should allow feature update");
         }
     });
     let test = builder.build(&server).await?;
@@ -1979,6 +1985,81 @@ async fn approving_execpolicy_amendment_persists_policy_and_skips_future_prompts
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(unix)]
+async fn matched_prefix_rule_runs_unsandboxed_under_zsh_fork() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let Some(runtime) = zsh_fork_runtime("zsh-fork prefix rule unsandboxed test")? else {
+        return Ok(());
+    };
+
+    let approval_policy = AskForApproval::Never;
+    let sandbox_policy = restrictive_workspace_write_policy();
+    let outside_dir = tempfile::tempdir_in(std::env::current_dir()?)?;
+    let outside_path = outside_dir
+        .path()
+        .join("zsh-fork-prefix-rule-unsandboxed.txt");
+    let command = format!("touch {outside_path:?}");
+    let rules = r#"prefix_rule(pattern=["touch"], decision="allow")"#.to_string();
+
+    let server = start_mock_server().await;
+    let outside_path_for_hook = outside_path.clone();
+    let test = build_zsh_fork_test(
+        &server,
+        runtime,
+        approval_policy,
+        sandbox_policy.clone(),
+        move |home| {
+            let _ = fs::remove_file(&outside_path_for_hook);
+            let rules_dir = home.join("rules");
+            fs::create_dir_all(&rules_dir).unwrap();
+            fs::write(rules_dir.join("default.rules"), &rules).unwrap();
+        },
+    )
+    .await?;
+
+    let call_id = "zsh-fork-prefix-rule-unsandboxed";
+    let event = shell_event(call_id, &command, 1_000, SandboxPermissions::UseDefault)?;
+    let _ = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-zsh-fork-prefix-1"),
+            event,
+            ev_completed("resp-zsh-fork-prefix-1"),
+        ]),
+    )
+    .await;
+    let results = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("msg-zsh-fork-prefix-1", "done"),
+            ev_completed("resp-zsh-fork-prefix-2"),
+        ]),
+    )
+    .await;
+
+    submit_turn(
+        &test,
+        "run allowed touch under zsh fork",
+        approval_policy,
+        sandbox_policy,
+    )
+    .await?;
+
+    wait_for_completion_without_approval(&test).await;
+
+    let result = parse_result(&results.single_request().function_call_output(call_id));
+    assert_eq!(result.exit_code.unwrap_or(0), 0);
+    assert!(
+        outside_path.exists(),
+        "expected matched prefix_rule to rerun touch unsandboxed; output: {}",
+        result.stdout
+    );
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "current_thread")]
 #[cfg(unix)]
 async fn invalid_requested_prefix_rule_falls_back_for_compound_command() -> Result<()> {
@@ -2153,7 +2234,12 @@ async fn denying_network_policy_amendment_persists_policy_and_skips_future_netwo
     let home = Arc::new(TempDir::new()?);
     fs::write(
         home.path().join("config.toml"),
-        r#"[permissions.network]
+        r#"default_permissions = "workspace"
+
+[permissions.workspace.filesystem]
+":minimal" = "read"
+
+[permissions.workspace.network]
 enabled = true
 mode = "limited"
 allow_local_binding = true
@@ -2204,20 +2290,16 @@ allow_local_binding = true
         test.config.permissions.network.is_some(),
         "expected managed network proxy config to be present"
     );
-    let runtime_proxy = test
-        .session_configured
+    test.session_configured
         .network_proxy
         .as_ref()
         .expect("expected runtime managed network proxy addresses");
-    let proxy_addr = runtime_proxy.http_addr.as_str();
 
     let call_id_first = "allow-network-first";
-    // Use the same urllib-based pattern as the other network integration tests,
-    // but point it at the runtime proxy directly so the blocked host reliably
-    // produces a network approval request without relying on curl.
-    let fetch_command = format!(
-        "python3 -c \"import urllib.request; proxy = urllib.request.ProxyHandler({{'http': 'http://{proxy_addr}'}}); opener = urllib.request.build_opener(proxy); print('OK:' + opener.open('http://codex-network-test.invalid', timeout=30).read().decode(errors='replace'))\""
-    );
+    // Use urllib without overriding proxy settings so managed-network sessions
+    // continue to exercise the env-based proxy routing path under bubblewrap.
+    let fetch_command = r#"python3 -c "import urllib.request; opener = urllib.request.build_opener(urllib.request.ProxyHandler()); print('OK:' + opener.open('http://codex-network-test.invalid', timeout=30).read().decode(errors='replace'))""#
+        .to_string();
     let first_event = shell_event(
         call_id_first,
         &fetch_command,

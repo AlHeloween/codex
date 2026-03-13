@@ -3,6 +3,7 @@ use crate::CodexAuth;
 use crate::ModelProviderInfo;
 use crate::agent::AgentControl;
 use crate::codex::Codex;
+use crate::codex::CodexSpawnArgs;
 use crate::codex::CodexSpawnOk;
 use crate::codex::INITIAL_SUBMIT_ID;
 use crate::codex_thread::CodexThread;
@@ -11,27 +12,34 @@ use crate::error::CodexErr;
 use crate::error::Result as CodexResult;
 use crate::file_watcher::FileWatcher;
 use crate::file_watcher::FileWatcherEvent;
+use crate::mcp::McpManager;
+use crate::models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use crate::models_manager::manager::ModelsManager;
+use crate::plugins::PluginsManager;
 use crate::protocol::Event;
 use crate::protocol::EventMsg;
 use crate::protocol::SessionConfiguredEvent;
 use crate::rollout::RolloutRecorder;
 use crate::rollout::truncation;
+use crate::shell_snapshot::ShellSnapshot;
 use crate::skills::SkillsManager;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::openai_models::ModelPreset;
-use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::McpServerRefreshConfig;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::W3cTraceContext;
+use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 use tokio::runtime::Handle;
 use tokio::runtime::RuntimeFlavor;
 use tokio::sync::RwLock;
@@ -115,6 +123,19 @@ pub struct NewThread {
     pub session_configured: SessionConfiguredEvent,
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ThreadShutdownReport {
+    pub completed: Vec<ThreadId>,
+    pub submit_failed: Vec<ThreadId>,
+    pub timed_out: Vec<ThreadId>,
+}
+
+enum ShutdownOutcome {
+    Complete,
+    SubmitFailed,
+    TimedOut,
+}
+
 /// [`ThreadManager`] is responsible for creating threads and maintaining
 /// them in memory.
 pub struct ThreadManager {
@@ -131,6 +152,8 @@ pub(crate) struct ThreadManagerState {
     auth_manager: Arc<AuthManager>,
     models_manager: Arc<ModelsManager>,
     skills_manager: Arc<SkillsManager>,
+    plugins_manager: Arc<PluginsManager>,
+    mcp_manager: Arc<McpManager>,
     file_watcher: Arc<FileWatcher>,
     session_source: SessionSource,
     // Captures submitted ops for testing purpose when test mode is enabled.
@@ -139,13 +162,20 @@ pub(crate) struct ThreadManagerState {
 
 impl ThreadManager {
     pub fn new(
-        codex_home: PathBuf,
+        config: &Config,
         auth_manager: Arc<AuthManager>,
         session_source: SessionSource,
-        model_catalog: Option<ModelsResponse>,
+        collaboration_modes_config: CollaborationModesConfig,
     ) -> Self {
+        let codex_home = config.codex_home.clone();
         let (thread_created_tx, _) = broadcast::channel(THREAD_CREATED_CHANNEL_CAPACITY);
-        let skills_manager = Arc::new(SkillsManager::new(codex_home.clone()));
+        let plugins_manager = Arc::new(PluginsManager::new(codex_home.clone()));
+        let mcp_manager = Arc::new(McpManager::new(Arc::clone(&plugins_manager)));
+        let skills_manager = Arc::new(SkillsManager::new(
+            codex_home.clone(),
+            Arc::clone(&plugins_manager),
+            config.bundled_skills_enabled(),
+        ));
         let file_watcher = build_file_watcher(codex_home.clone(), Arc::clone(&skills_manager));
         Self {
             state: Arc::new(ThreadManagerState {
@@ -154,9 +184,12 @@ impl ThreadManager {
                 models_manager: Arc::new(ModelsManager::new(
                     codex_home,
                     auth_manager.clone(),
-                    model_catalog,
+                    config.model_catalog.clone(),
+                    collaboration_modes_config,
                 )),
                 skills_manager,
+                plugins_manager,
+                mcp_manager,
                 file_watcher,
                 auth_manager,
                 session_source,
@@ -196,7 +229,13 @@ impl ThreadManager {
         set_thread_manager_test_mode_for_tests(true);
         let auth_manager = AuthManager::from_auth_for_testing(auth);
         let (thread_created_tx, _) = broadcast::channel(THREAD_CREATED_CHANNEL_CAPACITY);
-        let skills_manager = Arc::new(SkillsManager::new(codex_home.clone()));
+        let plugins_manager = Arc::new(PluginsManager::new(codex_home.clone()));
+        let mcp_manager = Arc::new(McpManager::new(Arc::clone(&plugins_manager)));
+        let skills_manager = Arc::new(SkillsManager::new(
+            codex_home.clone(),
+            Arc::clone(&plugins_manager),
+            true,
+        ));
         let file_watcher = build_file_watcher(codex_home.clone(), Arc::clone(&skills_manager));
         Self {
             state: Arc::new(ThreadManagerState {
@@ -208,6 +247,8 @@ impl ThreadManager {
                     provider,
                 )),
                 skills_manager,
+                plugins_manager,
+                mcp_manager,
                 file_watcher,
                 auth_manager,
                 session_source: SessionSource::Exec,
@@ -224,6 +265,14 @@ impl ThreadManager {
 
     pub fn skills_manager(&self) -> Arc<SkillsManager> {
         self.state.skills_manager.clone()
+    }
+
+    pub fn plugins_manager(&self) -> Arc<PluginsManager> {
+        self.state.plugins_manager.clone()
+    }
+
+    pub fn mcp_manager(&self) -> Arc<McpManager> {
+        self.state.mcp_manager.clone()
     }
 
     pub fn subscribe_file_watcher(&self) -> broadcast::Receiver<FileWatcherEvent> {
@@ -249,7 +298,7 @@ impl ThreadManager {
     }
 
     pub async fn list_thread_ids(&self) -> Vec<ThreadId> {
-        self.state.threads.read().await.keys().copied().collect()
+        self.state.list_thread_ids().await
     }
 
     pub async fn refresh_mcp_servers(&self, refresh_config: McpServerRefreshConfig) {
@@ -282,8 +331,9 @@ impl ThreadManager {
     }
 
     pub async fn start_thread(&self, config: Config) -> CodexResult<NewThread> {
-        self.start_thread_with_tools(config, Vec::new(), false)
-            .await
+        // Box delegated thread-spawn futures so these convenience wrappers do
+        // not inline the full spawn path into every caller's async state.
+        Box::pin(self.start_thread_with_tools(config, Vec::new(), false)).await
     }
 
     pub async fn start_thread_with_tools(
@@ -292,12 +342,13 @@ impl ThreadManager {
         dynamic_tools: Vec<codex_protocol::dynamic_tools::DynamicToolSpec>,
         persist_extended_history: bool,
     ) -> CodexResult<NewThread> {
-        self.start_thread_with_tools_and_service_name(
+        Box::pin(self.start_thread_with_tools_and_service_name(
             config,
             dynamic_tools,
             persist_extended_history,
             None,
-        )
+            None,
+        ))
         .await
     }
 
@@ -307,18 +358,19 @@ impl ThreadManager {
         dynamic_tools: Vec<codex_protocol::dynamic_tools::DynamicToolSpec>,
         persist_extended_history: bool,
         metrics_service_name: Option<String>,
+        parent_trace: Option<W3cTraceContext>,
     ) -> CodexResult<NewThread> {
-        self.state
-            .spawn_thread(
-                config,
-                InitialHistory::New,
-                Arc::clone(&self.state.auth_manager),
-                self.agent_control(),
-                dynamic_tools,
-                persist_extended_history,
-                metrics_service_name,
-            )
-            .await
+        Box::pin(self.state.spawn_thread(
+            config,
+            InitialHistory::New,
+            Arc::clone(&self.state.auth_manager),
+            self.agent_control(),
+            dynamic_tools,
+            persist_extended_history,
+            metrics_service_name,
+            parent_trace,
+        ))
+        .await
     }
 
     pub async fn resume_thread_from_rollout(
@@ -326,10 +378,17 @@ impl ThreadManager {
         config: Config,
         rollout_path: PathBuf,
         auth_manager: Arc<AuthManager>,
+        parent_trace: Option<W3cTraceContext>,
     ) -> CodexResult<NewThread> {
         let initial_history = RolloutRecorder::get_rollout_history(&rollout_path).await?;
-        self.resume_thread_with_history(config, initial_history, auth_manager, false)
-            .await
+        Box::pin(self.resume_thread_with_history(
+            config,
+            initial_history,
+            auth_manager,
+            false,
+            parent_trace,
+        ))
+        .await
     }
 
     pub async fn resume_thread_with_history(
@@ -338,18 +397,19 @@ impl ThreadManager {
         initial_history: InitialHistory,
         auth_manager: Arc<AuthManager>,
         persist_extended_history: bool,
+        parent_trace: Option<W3cTraceContext>,
     ) -> CodexResult<NewThread> {
-        self.state
-            .spawn_thread(
-                config,
-                initial_history,
-                auth_manager,
-                self.agent_control(),
-                Vec::new(),
-                persist_extended_history,
-                None,
-            )
-            .await
+        Box::pin(self.state.spawn_thread(
+            config,
+            initial_history,
+            auth_manager,
+            self.agent_control(),
+            Vec::new(),
+            persist_extended_history,
+            None,
+            parent_trace,
+        ))
+        .await
     }
 
     /// Removes the thread from the manager's internal map, though the thread is stored
@@ -359,13 +419,55 @@ impl ThreadManager {
         self.state.threads.write().await.remove(thread_id)
     }
 
-    /// Closes all threads open in this ThreadManager
-    pub async fn remove_and_close_all_threads(&self) -> CodexResult<()> {
-        for thread in self.state.threads.read().await.values() {
-            thread.submit(Op::Shutdown).await?;
+    /// Tries to shut down all tracked threads concurrently within the provided timeout.
+    /// Threads that complete shutdown are removed from the manager; incomplete shutdowns
+    /// remain tracked so callers can retry or inspect them later.
+    pub async fn shutdown_all_threads_bounded(&self, timeout: Duration) -> ThreadShutdownReport {
+        let threads = {
+            let threads = self.state.threads.read().await;
+            threads
+                .iter()
+                .map(|(thread_id, thread)| (*thread_id, Arc::clone(thread)))
+                .collect::<Vec<_>>()
+        };
+
+        let mut shutdowns = threads
+            .into_iter()
+            .map(|(thread_id, thread)| async move {
+                let outcome = match tokio::time::timeout(timeout, thread.shutdown_and_wait()).await
+                {
+                    Ok(Ok(())) => ShutdownOutcome::Complete,
+                    Ok(Err(_)) => ShutdownOutcome::SubmitFailed,
+                    Err(_) => ShutdownOutcome::TimedOut,
+                };
+                (thread_id, outcome)
+            })
+            .collect::<FuturesUnordered<_>>();
+        let mut report = ThreadShutdownReport::default();
+
+        while let Some((thread_id, outcome)) = shutdowns.next().await {
+            match outcome {
+                ShutdownOutcome::Complete => report.completed.push(thread_id),
+                ShutdownOutcome::SubmitFailed => report.submit_failed.push(thread_id),
+                ShutdownOutcome::TimedOut => report.timed_out.push(thread_id),
+            }
         }
-        self.state.threads.write().await.clear();
-        Ok(())
+
+        let mut tracked_threads = self.state.threads.write().await;
+        for thread_id in &report.completed {
+            tracked_threads.remove(thread_id);
+        }
+
+        report
+            .completed
+            .sort_by_key(std::string::ToString::to_string);
+        report
+            .submit_failed
+            .sort_by_key(std::string::ToString::to_string);
+        report
+            .timed_out
+            .sort_by_key(std::string::ToString::to_string);
+        report
     }
 
     /// Fork an existing thread by taking messages up to the given position (not including
@@ -378,20 +480,21 @@ impl ThreadManager {
         config: Config,
         path: PathBuf,
         persist_extended_history: bool,
+        parent_trace: Option<W3cTraceContext>,
     ) -> CodexResult<NewThread> {
         let history = RolloutRecorder::get_rollout_history(&path).await?;
         let history = truncate_before_nth_user_message(history, nth_user_message);
-        self.state
-            .spawn_thread(
-                config,
-                history,
-                Arc::clone(&self.state.auth_manager),
-                self.agent_control(),
-                Vec::new(),
-                persist_extended_history,
-                None,
-            )
-            .await
+        Box::pin(self.state.spawn_thread(
+            config,
+            history,
+            Arc::clone(&self.state.auth_manager),
+            self.agent_control(),
+            Vec::new(),
+            persist_extended_history,
+            None,
+            parent_trace,
+        ))
+        .await
     }
 
     pub(crate) fn agent_control(&self) -> AgentControl {
@@ -409,6 +512,10 @@ impl ThreadManager {
 }
 
 impl ThreadManagerState {
+    pub(crate) async fn list_thread_ids(&self) -> Vec<ThreadId> {
+        self.threads.read().await.keys().copied().collect()
+    }
+
     /// Fetch a thread by ID or return ThreadNotFound.
     pub(crate) async fn get_thread(&self, thread_id: ThreadId) -> CodexResult<Arc<CodexThread>> {
         let threads = self.threads.read().await;
@@ -440,13 +547,14 @@ impl ThreadManagerState {
         config: Config,
         agent_control: AgentControl,
     ) -> CodexResult<NewThread> {
-        self.spawn_new_thread_with_source(
+        Box::pin(self.spawn_new_thread_with_source(
             config,
             agent_control,
             self.session_source.clone(),
             false,
             None,
-        )
+            None,
+        ))
         .await
     }
 
@@ -457,8 +565,9 @@ impl ThreadManagerState {
         session_source: SessionSource,
         persist_extended_history: bool,
         metrics_service_name: Option<String>,
+        inherited_shell_snapshot: Option<Arc<ShellSnapshot>>,
     ) -> CodexResult<NewThread> {
-        self.spawn_thread_with_source(
+        Box::pin(self.spawn_thread_with_source(
             config,
             InitialHistory::New,
             Arc::clone(&self.auth_manager),
@@ -467,7 +576,9 @@ impl ThreadManagerState {
             Vec::new(),
             persist_extended_history,
             metrics_service_name,
-        )
+            inherited_shell_snapshot,
+            None,
+        ))
         .await
     }
 
@@ -477,9 +588,10 @@ impl ThreadManagerState {
         rollout_path: PathBuf,
         agent_control: AgentControl,
         session_source: SessionSource,
+        inherited_shell_snapshot: Option<Arc<ShellSnapshot>>,
     ) -> CodexResult<NewThread> {
         let initial_history = RolloutRecorder::get_rollout_history(&rollout_path).await?;
-        self.spawn_thread_with_source(
+        Box::pin(self.spawn_thread_with_source(
             config,
             initial_history,
             Arc::clone(&self.auth_manager),
@@ -488,7 +600,33 @@ impl ThreadManagerState {
             Vec::new(),
             false,
             None,
-        )
+            inherited_shell_snapshot,
+            None,
+        ))
+        .await
+    }
+
+    pub(crate) async fn fork_thread_with_source(
+        &self,
+        config: Config,
+        initial_history: InitialHistory,
+        agent_control: AgentControl,
+        session_source: SessionSource,
+        persist_extended_history: bool,
+        inherited_shell_snapshot: Option<Arc<ShellSnapshot>>,
+    ) -> CodexResult<NewThread> {
+        Box::pin(self.spawn_thread_with_source(
+            config,
+            initial_history,
+            Arc::clone(&self.auth_manager),
+            agent_control,
+            session_source,
+            Vec::new(),
+            persist_extended_history,
+            None,
+            inherited_shell_snapshot,
+            None,
+        ))
         .await
     }
 
@@ -503,8 +641,9 @@ impl ThreadManagerState {
         dynamic_tools: Vec<codex_protocol::dynamic_tools::DynamicToolSpec>,
         persist_extended_history: bool,
         metrics_service_name: Option<String>,
+        parent_trace: Option<W3cTraceContext>,
     ) -> CodexResult<NewThread> {
-        self.spawn_thread_with_source(
+        Box::pin(self.spawn_thread_with_source(
             config,
             initial_history,
             auth_manager,
@@ -513,7 +652,9 @@ impl ThreadManagerState {
             dynamic_tools,
             persist_extended_history,
             metrics_service_name,
-        )
+            None,
+            parent_trace,
+        ))
         .await
     }
 
@@ -528,23 +669,31 @@ impl ThreadManagerState {
         dynamic_tools: Vec<codex_protocol::dynamic_tools::DynamicToolSpec>,
         persist_extended_history: bool,
         metrics_service_name: Option<String>,
+        inherited_shell_snapshot: Option<Arc<ShellSnapshot>>,
+        parent_trace: Option<W3cTraceContext>,
     ) -> CodexResult<NewThread> {
-        let watch_registration = self.file_watcher.register_config(&config);
+        let watch_registration = self
+            .file_watcher
+            .register_config(&config, self.skills_manager.as_ref());
         let CodexSpawnOk {
             codex, thread_id, ..
-        } = Codex::spawn(
+        } = Codex::spawn(CodexSpawnArgs {
             config,
             auth_manager,
-            Arc::clone(&self.models_manager),
-            Arc::clone(&self.skills_manager),
-            Arc::clone(&self.file_watcher),
-            initial_history,
+            models_manager: Arc::clone(&self.models_manager),
+            skills_manager: Arc::clone(&self.skills_manager),
+            plugins_manager: Arc::clone(&self.plugins_manager),
+            mcp_manager: Arc::clone(&self.mcp_manager),
+            file_watcher: Arc::clone(&self.file_watcher),
+            conversation_history: initial_history,
             session_source,
             agent_control,
             dynamic_tools,
             persist_extended_history,
             metrics_service_name,
-        )
+            inherited_shell_snapshot,
+            parent_trace,
+        })
         .await?;
         self.finalize_thread_spawn(codex, thread_id, watch_registration)
             .await
@@ -601,117 +750,5 @@ fn truncate_before_nth_user_message(history: InitialHistory, n: usize) -> Initia
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::codex::make_session_and_context;
-    use assert_matches::assert_matches;
-    use codex_protocol::models::ContentItem;
-    use codex_protocol::models::ReasoningItemReasoningSummary;
-    use codex_protocol::models::ResponseItem;
-    use pretty_assertions::assert_eq;
-
-    fn user_msg(text: &str) -> ResponseItem {
-        ResponseItem::Message {
-            id: None,
-            role: "user".to_string(),
-            content: vec![ContentItem::OutputText {
-                text: text.to_string(),
-            }],
-            end_turn: None,
-            phase: None,
-        }
-    }
-    fn assistant_msg(text: &str) -> ResponseItem {
-        ResponseItem::Message {
-            id: None,
-            role: "assistant".to_string(),
-            content: vec![ContentItem::OutputText {
-                text: text.to_string(),
-            }],
-            end_turn: None,
-            phase: None,
-        }
-    }
-
-    #[test]
-    fn drops_from_last_user_only() {
-        let items = [
-            user_msg("u1"),
-            assistant_msg("a1"),
-            assistant_msg("a2"),
-            user_msg("u2"),
-            assistant_msg("a3"),
-            ResponseItem::Reasoning {
-                id: "r1".to_string(),
-                summary: vec![ReasoningItemReasoningSummary::SummaryText {
-                    text: "s".to_string(),
-                }],
-                content: None,
-                encrypted_content: None,
-            },
-            ResponseItem::FunctionCall {
-                id: None,
-                call_id: "c1".to_string(),
-                name: "tool".to_string(),
-                arguments: "{}".to_string(),
-            },
-            assistant_msg("a4"),
-        ];
-
-        let initial: Vec<RolloutItem> = items
-            .iter()
-            .cloned()
-            .map(RolloutItem::ResponseItem)
-            .collect();
-        let truncated = truncate_before_nth_user_message(InitialHistory::Forked(initial), 1);
-        let got_items = truncated.get_rollout_items();
-        let expected_items = vec![
-            RolloutItem::ResponseItem(items[0].clone()),
-            RolloutItem::ResponseItem(items[1].clone()),
-            RolloutItem::ResponseItem(items[2].clone()),
-        ];
-        assert_eq!(
-            serde_json::to_value(&got_items).unwrap(),
-            serde_json::to_value(&expected_items).unwrap()
-        );
-
-        let initial2: Vec<RolloutItem> = items
-            .iter()
-            .cloned()
-            .map(RolloutItem::ResponseItem)
-            .collect();
-        let truncated2 = truncate_before_nth_user_message(InitialHistory::Forked(initial2), 2);
-        assert_matches!(truncated2, InitialHistory::New);
-    }
-
-    #[tokio::test]
-    async fn ignores_session_prefix_messages_when_truncating() {
-        let (session, turn_context) = make_session_and_context().await;
-        let mut items = session.build_initial_context(&turn_context).await;
-        items.push(user_msg("feature request"));
-        items.push(assistant_msg("ack"));
-        items.push(user_msg("second question"));
-        items.push(assistant_msg("answer"));
-
-        let rollout_items: Vec<RolloutItem> = items
-            .iter()
-            .cloned()
-            .map(RolloutItem::ResponseItem)
-            .collect();
-
-        let truncated = truncate_before_nth_user_message(InitialHistory::Forked(rollout_items), 1);
-        let got_items = truncated.get_rollout_items();
-
-        let expected: Vec<RolloutItem> = vec![
-            RolloutItem::ResponseItem(items[0].clone()),
-            RolloutItem::ResponseItem(items[1].clone()),
-            RolloutItem::ResponseItem(items[2].clone()),
-            RolloutItem::ResponseItem(items[3].clone()),
-        ];
-
-        assert_eq!(
-            serde_json::to_value(&got_items).unwrap(),
-            serde_json::to_value(&expected).unwrap()
-        );
-    }
-}
+#[path = "thread_manager_tests.rs"]
+mod tests;

@@ -1,244 +1,34 @@
-# Configuration (`config.toml`)
+# Configuration
 
-Codex is primarily configured via a TOML file located under your Codex home directory.
+For basic configuration instructions, see [this documentation](https://developers.openai.com/codex/config-basic).
 
-- Default location: `~/.codex/config.toml`
-- Override location by setting `CODEX_HOME` (then config is loaded from `$CODEX_HOME/config.toml`)
+For advanced configuration instructions, see [this documentation](https://developers.openai.com/codex/config-advanced).
 
-This document focuses on **how to think about the settings**, how **precedence** works, and the **most commonly used keys**.
+For a full configuration reference, see [this documentation](https://developers.openai.com/codex/config-reference).
 
-For official, always-up-to-date reference docs, see:
+## Connecting to MCP servers
 
-- Basic configuration: https://developers.openai.com/codex/config-basic
-- Advanced configuration: https://developers.openai.com/codex/config-advanced
-- Full key reference: https://developers.openai.com/codex/config-reference
-
-## JSON Schema (authoritative in-repo reference)
-
-The generated JSON Schema for `config.toml` is committed at:
-
-- `codex-rs/core/config.schema.json`
-
-If you use an editor with TOML + JSON-schema support, you can point it at this file to get:
-
-- Auto-complete
-- Inline documentation
-- Type validation
-
-## Configuration precedence (what wins?)
-
-Codex merges configuration from multiple "levels". When the same setting is defined in more than one place, **higher precedence wins**.
-
-Precedence (highest to lowest) is:
-
-1. Explicit CLI flags for the setting (example: `--model ...`)
-2. Profile settings (selected by `--profile ...` or by `profile = "..."` in `config.toml`)
-3. Top-level keys in `config.toml`
-4. Built-in defaults in code
-
-This precedence is documented in code (and tested) in the config module.
-
-## Common patterns
-
-### Minimal example
-
-```toml
-# Pick a default model
-model = "gpt-5.1-codex"
-
-# Make the default behavior safe for local repos
-approval_policy = "untrusted"
-sandbox_mode = "read-only"
-```
-
-### Profiles (recommended)
-
-Use profiles when you want to switch between coherent "bundles" of settings.
-
-```toml
-profile = "work"
-
-[profiles.work]
-model = "gpt-5.1-codex"
-approval_policy = "untrusted"
-sandbox_mode = "read-only"
-
-[profiles.local_dev]
-model = "gpt-5.1-codex"
-approval_policy = "on-request"
-sandbox_mode = "workspace-write"
-```
-
-Then start Codex with:
-
-```bash
-codex --profile local_dev
-```
-
-### One-off overrides (`-c key=value`)
-
-Many Codex front-ends accept `-c` to apply a one-off override at runtime (useful for CI or ad-hoc sessions).
-
-Example:
-
-```bash
-codex -c suppress_cyber_safety_warning=true
-```
-
-## Core top-level keys
-
-This section describes the most important keys you're likely to set directly.
-
-### `model`
-
-Default model slug to use when the client does not explicitly request one.
-
-```toml
-model = "gpt-5.1-codex"
-```
-
-Related:
-
-- `review_model`: model used for `/review` sessions.
-- `model_reasoning_effort`: controls `reasoning.effort` (Responses API).
-- `model_reasoning_summary`: controls `reasoning.summary`.
-- `model_verbosity`: GPT-5 verbosity control (`text.verbosity`).
-
-### `model_provider`
-
-Selects which entry in `model_providers` should be used.
-
-```toml
-model_provider = "openai"
-```
-
-### `model_providers.<id>`
-
-Defines model provider endpoints and auth wiring.
-
-Typical fields include:
-
-- `base_url` (example: `https://api.openai.com/v1`)
-- `env_key` (example: `OPENAI_API_KEY`)
-- `wire_api` (for example, `responses`)
-
-Example:
-
-```toml
-[model_providers.openai]
-name = "OpenAI"
-base_url = "https://api.openai.com/v1"
-env_key = "OPENAI_API_KEY"
-wire_api = "responses"
-```
-
-### `approval_policy`
-
-Controls _when_ Codex asks you before executing commands.
-
-Common values:
-
-- `"untrusted"`: conservative; only allow a very small set of safe read-only commands without asking.
-- `"on-request"`: model chooses when to ask.
-- `"never"`: never ask (non-interactive style).
-
-Example:
-
-```toml
-approval_policy = "untrusted"
-```
-
-### `sandbox_mode`
-
-Controls _how_ command execution is sandboxed.
-
-Common values:
-
-- `"read-only"`: disallow writes by default.
-- `"workspace-write"`: allow writes under controlled conditions.
-
-Example:
-
-```toml
-sandbox_mode = "read-only"
-```
-
-### `web_search`
-
-Controls web search tool behavior:
-
-- `"disabled"`
-- `"cached"`
-- `"live"`
-
-Example:
-
-```toml
-web_search = "cached"
-```
-
-### `developer_instructions` and `model_instructions_file`
-
-Two different concepts:
-
-- `developer_instructions`: a developer message inserted into the prompt at runtime.
-- `model_instructions_file`: replaces built-in model instructions from a file.
-
-The latter is discouraged because it can degrade model performance.
-
-### `notify`
-
-Runs an external notification command after each completed **turn**.
-
-```toml
-notify = ["notify-send", "Codex"]
-```
-
-Codex appends a JSON payload argument when it runs the command.
-
-### `log_dir`
-
-Directory where Codex writes logs (default: `$CODEX_HOME/log`).
-
-```toml
-log_dir = "/abs/path/to/codex-logs"
-```
-
-### `history`
-
-Controls whether/what is persisted in `~/.codex/history.jsonl`.
-
-If you need privacy or ephemeral runs, look for:
-
-- `ephemeral` (session does not persist)
-
-### `mcp_servers` (tools via MCP)
-
-You can configure MCP servers under `mcp_servers`.
-
-Because MCP configuration has its own detailed shape, this doc intentionally stays high-level.
-Use the official config reference for the latest MCP options:
+Codex can connect to MCP servers configured in `~/.codex/config.toml`. See the configuration reference for the latest MCP server options:
 
 - https://developers.openai.com/codex/config-reference
 
-### `apps` (Connectors)
+## Apps (Connectors)
 
-Settings under `[apps]` configure app/connector visibility.
+Use `$` in the composer to insert a ChatGPT connector; the popover lists accessible
+apps. The `/apps` command lists available and installed apps. Connected apps appear first
+and are labeled as connected; others are marked as can be installed.
 
-In the UI:
+## Notify
 
-- Use `$` in the composer to insert a connector.
-- Use `/apps` to list apps.
+Codex can run a notification hook when the agent finishes a turn. See the configuration reference for the latest notification settings:
 
-## TUI settings (`[tui]`)
+- https://developers.openai.com/codex/config-reference
 
-If you use the terminal UI, the `[tui]` table contains UI-specific behavior.
+When Codex knows which client started the turn, the legacy notify JSON payload also includes a top-level `client` field. The TUI reports `codex-tui`, and the app server reports the `clientInfo.name` value from `initialize`.
 
-Common items include:
+## JSON Schema
 
-- Alternate screen behavior
-- Notification preferences
-- Status line configuration
+The generated JSON Schema for `config.toml` lives at `codex-rs/core/config.schema.json`.
 
 ## SQLite State DB
 
@@ -246,13 +36,31 @@ Codex stores the SQLite-backed state DB under `sqlite_home` (config key) or the
 `CODEX_SQLITE_HOME` environment variable. When unset, WorkspaceWrite sandbox
 sessions default to a temp directory; other modes default to `CODEX_HOME`.
 
-## Notices (`[notice]`)
+## Custom CA Certificates
+
+Codex can trust a custom root CA bundle for outbound HTTPS and secure websocket
+connections when enterprise proxies or gateways intercept TLS. This applies to
+login flows and to Codex's other external connections, including Codex
+components that build reqwest clients or secure websocket clients through the
+shared `codex-client` CA-loading path and remote MCP connections that use it.
+
+Set `CODEX_CA_CERTIFICATE` to the path of a PEM file containing one or more
+certificate blocks to use a Codex-specific CA bundle. If
+`CODEX_CA_CERTIFICATE` is unset, Codex falls back to `SSL_CERT_FILE`. If
+neither variable is set, Codex uses the system root certificates.
+
+`CODEX_CA_CERTIFICATE` takes precedence over `SSL_CERT_FILE`. Empty values are
+treated as unset.
+
+The PEM file may contain multiple certificates. Codex also tolerates OpenSSL
+`TRUSTED CERTIFICATE` labels and ignores well-formed `X509 CRL` sections in the
+same bundle. If the file is empty, unreadable, or malformed, the affected Codex
+HTTP or secure websocket connection reports a user-facing error that points
+back to these environment variables.
+
+## Notices
 
 Codex stores "do not show again" flags for some UI prompts under the `[notice]` table.
-
-Example behavior:
-
-- Ctrl+C / Ctrl+D quitting uses a ~1 second double-press hint (`ctrl + c again to quit`).
 
 ## Suppressing warnings
 
@@ -279,5 +87,12 @@ effort override. When unset, Plan mode uses the built-in Plan preset default
 Plan preset. The string value `none` means "no reasoning" (an explicit Plan
 override), not "inherit the global default". There is currently no separate
 config value for "follow the global default in Plan mode".
+
+## Realtime start instructions
+
+`experimental_realtime_start_instructions` lets you replace the built-in
+developer message Codex inserts when realtime becomes active. It only affects
+the realtime start message in prompt history and does not change websocket
+backend prompt settings or the realtime end/inactive message.
 
 Ctrl+C/Ctrl+D quitting uses a ~1 second double-press hint (`ctrl + c again to quit`).
