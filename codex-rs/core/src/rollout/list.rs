@@ -1039,7 +1039,7 @@ async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTai
                     summary.git_sha = session_meta_line
                         .git
                         .as_ref()
-                        .and_then(|git| git.commit_hash.clone());
+                        .and_then(|git| git.commit_hash.as_ref().map(|sha| sha.0.clone()));
                     summary.git_origin_url = session_meta_line
                         .git
                         .as_ref()
@@ -1223,7 +1223,7 @@ async fn find_thread_path_by_id_str_in_subdir(
         ..Default::default()
     };
 
-    let results = file_search::run(id_str, vec![root], options, None)
+    let results = file_search::run(id_str, vec![root], options, /*cancel_flag*/ None)
         .map_err(|e| io::Error::other(format!("file search failed: {e}")))?;
 
     let found = results.matches.into_iter().next().map(|m| m.full_path());

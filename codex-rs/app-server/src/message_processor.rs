@@ -10,6 +10,7 @@ use crate::codex_message_processor::CodexMessageProcessorArgs;
 use crate::config_api::ConfigApi;
 use crate::error_code::INVALID_REQUEST_ERROR_CODE;
 use crate::external_agent_config_api::ExternalAgentConfigApi;
+use crate::fs_api::FsApi;
 use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::ConnectionRequestId;
 use crate::outgoing_message::OutgoingMessageSender;
@@ -29,6 +30,13 @@ use codex_app_server_protocol::ConfigWarningNotification;
 use codex_app_server_protocol::ExperimentalApi;
 use codex_app_server_protocol::ExternalAgentConfigDetectParams;
 use codex_app_server_protocol::ExternalAgentConfigImportParams;
+use codex_app_server_protocol::FsCopyParams;
+use codex_app_server_protocol::FsCreateDirectoryParams;
+use codex_app_server_protocol::FsGetMetadataParams;
+use codex_app_server_protocol::FsReadDirectoryParams;
+use codex_app_server_protocol::FsReadFileParams;
+use codex_app_server_protocol::FsRemoveParams;
+use codex_app_server_protocol::FsWriteFileParams;
 use codex_app_server_protocol::InitializeResponse;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCErrorError;
@@ -42,20 +50,22 @@ use codex_arg0::Arg0DispatchPaths;
 use codex_core::AnalyticsEventsClient;
 use codex_core::AuthManager;
 use codex_core::ThreadManager;
-use codex_core::auth::ExternalAuthRefreshContext;
-use codex_core::auth::ExternalAuthRefreshReason;
-use codex_core::auth::ExternalAuthRefresher;
-use codex_core::auth::ExternalAuthTokens;
 use codex_core::config::Config;
 use codex_core::config_loader::CloudRequirementsLoader;
 use codex_core::config_loader::LoaderOverrides;
+use codex_core::default_client::DEFAULT_ORIGINATOR;
 use codex_core::default_client::SetOriginatorError;
 use codex_core::default_client::USER_AGENT_SUFFIX;
 use codex_core::default_client::get_codex_user_agent;
 use codex_core::default_client::set_default_client_residency_requirement;
 use codex_core::default_client::set_default_originator;
 use codex_core::models_manager::collaboration_mode_presets::CollaborationModesConfig;
+use codex_features::Feature;
 use codex_feedback::CodexFeedback;
+use codex_login::auth::ExternalAuthRefreshContext;
+use codex_login::auth::ExternalAuthRefreshReason;
+use codex_login::auth::ExternalAuthRefresher;
+use codex_login::auth::ExternalAuthTokens;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::W3cTraceContext;
@@ -69,6 +79,7 @@ use toml::Value as TomlValue;
 use tracing::Instrument;
 
 const EXTERNAL_AUTH_REFRESH_TIMEOUT: Duration = Duration::from_secs(10);
+const TUI_APP_SERVER_CLIENT_NAME: &str = "codex-tui";
 
 #[derive(Clone)]
 struct ExternalAuthRefreshBridge {
@@ -139,6 +150,8 @@ pub(crate) struct MessageProcessor {
     codex_message_processor: CodexMessageProcessor,
     config_api: ConfigApi,
     external_agent_config_api: ExternalAgentConfigApi,
+    fs_api: FsApi,
+    auth_manager: Arc<AuthManager>,
     config: Arc<Config>,
     config_warnings: Arc<Vec<ConfigWarningNotification>>,
 }
@@ -188,12 +201,6 @@ impl MessageProcessor {
             enable_codex_api_key_env,
             config.cli_auth_credentials_store_mode,
         );
-        auth_manager.set_forced_chatgpt_workspace_id(config.forced_chatgpt_workspace_id.clone());
-        auth_manager.set_external_auth_refresher(Arc::new(ExternalAuthRefreshBridge {
-            outgoing: outgoing.clone(),
-        }));
-        let analytics_events_client =
-            AnalyticsEventsClient::new(Arc::clone(&config), Arc::clone(&auth_manager));
         let thread_manager = Arc::new(ThreadManager::new(
             config.as_ref(),
             auth_manager.clone(),
@@ -201,19 +208,22 @@ impl MessageProcessor {
             CollaborationModesConfig {
                 default_mode_request_user_input: config
                     .features
-                    .enabled(codex_core::features::Feature::DefaultModeRequestUserInput),
+                    .enabled(Feature::DefaultModeRequestUserInput),
             },
         ));
+        auth_manager.set_forced_chatgpt_workspace_id(config.forced_chatgpt_workspace_id.clone());
+        auth_manager.set_external_auth_refresher(Arc::new(ExternalAuthRefreshBridge {
+            outgoing: outgoing.clone(),
+        }));
+        let analytics_events_client =
+            AnalyticsEventsClient::new(Arc::clone(&config), Arc::clone(&auth_manager));
         thread_manager
             .plugins_manager()
             .set_analytics_events_client(analytics_events_client.clone());
-        // TODO(xl): Move into PluginManager once this no longer depends on config feature gating.
-        thread_manager
-            .plugins_manager()
-            .maybe_start_curated_repo_sync_for_config(&config);
+
         let cloud_requirements = Arc::new(RwLock::new(cloud_requirements));
         let codex_message_processor = CodexMessageProcessor::new(CodexMessageProcessorArgs {
-            auth_manager,
+            auth_manager: auth_manager.clone(),
             thread_manager: Arc::clone(&thread_manager),
             outgoing: outgoing.clone(),
             arg0_paths,
@@ -223,6 +233,11 @@ impl MessageProcessor {
             feedback,
             log_db,
         });
+        // Keep plugin startup warmups aligned at app-server startup.
+        // TODO(xl): Move into PluginManager once this no longer depends on config feature gating.
+        thread_manager
+            .plugins_manager()
+            .maybe_start_plugin_startup_tasks_for_config(&config, auth_manager.clone());
         let config_api = ConfigApi::new(
             config.codex_home.clone(),
             cli_overrides,
@@ -232,15 +247,22 @@ impl MessageProcessor {
             analytics_events_client,
         );
         let external_agent_config_api = ExternalAgentConfigApi::new(config.codex_home.clone());
+        let fs_api = FsApi::default();
 
         Self {
             outgoing,
             codex_message_processor,
             config_api,
             external_agent_config_api,
+            fs_api,
+            auth_manager,
             config,
             config_warnings: Arc::new(config_warnings),
         }
+    }
+
+    pub(crate) fn clear_runtime_references(&self) {
+        self.auth_manager.clear_external_auth_refresher();
     }
 
     pub(crate) async fn process_request(
@@ -304,7 +326,7 @@ impl MessageProcessor {
                     request_id.clone(),
                     codex_request,
                     session,
-                    None,
+                    /*outbound_initialized*/ None,
                     request_context.clone(),
                 )
                 .await;
@@ -330,7 +352,8 @@ impl MessageProcessor {
         };
         let request_span =
             crate::app_server_tracing::typed_request_span(&request, connection_id, session);
-        let request_context = RequestContext::new(request_id.clone(), request_span, None);
+        let request_context =
+            RequestContext::new(request_id.clone(), request_span, /*parent_trace*/ None);
         tracing::trace!(
             ?connection_id,
             request_id = ?request_id.request_id,
@@ -428,6 +451,12 @@ impl MessageProcessor {
         self.codex_message_processor.drain_background_tasks().await;
     }
 
+    pub(crate) async fn clear_all_thread_listeners(&self) {
+        self.codex_message_processor
+            .clear_all_thread_listeners()
+            .await;
+    }
+
     pub(crate) async fn shutdown_threads(&self) {
         self.codex_message_processor.shutdown_threads().await;
     }
@@ -513,7 +542,14 @@ impl MessageProcessor {
                 } = params.client_info;
                 session.app_server_client_name = Some(name.clone());
                 session.client_version = Some(version.clone());
-                if let Err(error) = set_default_originator(name.clone()) {
+                let originator = if name == TUI_APP_SERVER_CLIENT_NAME {
+                    // TODO: Remove this temporary workaround once app-server clients no longer
+                    // need to retain the legacy TUI `codex_cli_rs` originator behavior.
+                    DEFAULT_ORIGINATOR.to_string()
+                } else {
+                    name.clone()
+                };
+                if let Err(error) = set_default_originator(originator) {
                     match error {
                         SetOriginatorError::InvalidHeaderValue => {
                             let error = JSONRPCErrorError {
@@ -543,7 +579,11 @@ impl MessageProcessor {
                 }
 
                 let user_agent = get_codex_user_agent();
-                let response = InitializeResponse { user_agent };
+                let response = InitializeResponse {
+                    user_agent,
+                    platform_family: std::env::consts::FAMILY.to_string(),
+                    platform_os: std::env::consts::OS.to_string(),
+                };
                 self.outgoing
                     .send_response(connection_request_id, response)
                     .await;
@@ -645,6 +685,76 @@ impl MessageProcessor {
                 })
                 .await;
             }
+            ClientRequest::FsReadFile { request_id, params } => {
+                self.handle_fs_read_file(
+                    ConnectionRequestId {
+                        connection_id,
+                        request_id,
+                    },
+                    params,
+                )
+                .await;
+            }
+            ClientRequest::FsWriteFile { request_id, params } => {
+                self.handle_fs_write_file(
+                    ConnectionRequestId {
+                        connection_id,
+                        request_id,
+                    },
+                    params,
+                )
+                .await;
+            }
+            ClientRequest::FsCreateDirectory { request_id, params } => {
+                self.handle_fs_create_directory(
+                    ConnectionRequestId {
+                        connection_id,
+                        request_id,
+                    },
+                    params,
+                )
+                .await;
+            }
+            ClientRequest::FsGetMetadata { request_id, params } => {
+                self.handle_fs_get_metadata(
+                    ConnectionRequestId {
+                        connection_id,
+                        request_id,
+                    },
+                    params,
+                )
+                .await;
+            }
+            ClientRequest::FsReadDirectory { request_id, params } => {
+                self.handle_fs_read_directory(
+                    ConnectionRequestId {
+                        connection_id,
+                        request_id,
+                    },
+                    params,
+                )
+                .await;
+            }
+            ClientRequest::FsRemove { request_id, params } => {
+                self.handle_fs_remove(
+                    ConnectionRequestId {
+                        connection_id,
+                        request_id,
+                    },
+                    params,
+                )
+                .await;
+            }
+            ClientRequest::FsCopy { request_id, params } => {
+                self.handle_fs_copy(
+                    ConnectionRequestId {
+                        connection_id,
+                        request_id,
+                    },
+                    params,
+                )
+                .await;
+            }
             other => {
                 // Box the delegated future so this wrapper's async state machine does not
                 // inline the full `CodexMessageProcessor::process_request` future, which
@@ -678,7 +788,7 @@ impl MessageProcessor {
             Ok(response) => {
                 self.codex_message_processor.clear_plugin_related_caches();
                 self.codex_message_processor
-                    .maybe_start_curated_repo_sync_for_latest_config()
+                    .maybe_start_plugin_startup_tasks_for_latest_config()
                     .await;
                 self.outgoing.send_response(request_id, response).await;
             }
@@ -695,7 +805,7 @@ impl MessageProcessor {
             Ok(response) => {
                 self.codex_message_processor.clear_plugin_related_caches();
                 self.codex_message_processor
-                    .maybe_start_curated_repo_sync_for_latest_config()
+                    .maybe_start_plugin_startup_tasks_for_latest_config()
                     .await;
                 self.outgoing.send_response(request_id, response).await;
             }
@@ -727,6 +837,71 @@ impl MessageProcessor {
         params: ExternalAgentConfigImportParams,
     ) {
         match self.external_agent_config_api.import(params).await {
+            Ok(response) => self.outgoing.send_response(request_id, response).await,
+            Err(error) => self.outgoing.send_error(request_id, error).await,
+        }
+    }
+
+    async fn handle_fs_read_file(&self, request_id: ConnectionRequestId, params: FsReadFileParams) {
+        match self.fs_api.read_file(params).await {
+            Ok(response) => self.outgoing.send_response(request_id, response).await,
+            Err(error) => self.outgoing.send_error(request_id, error).await,
+        }
+    }
+
+    async fn handle_fs_write_file(
+        &self,
+        request_id: ConnectionRequestId,
+        params: FsWriteFileParams,
+    ) {
+        match self.fs_api.write_file(params).await {
+            Ok(response) => self.outgoing.send_response(request_id, response).await,
+            Err(error) => self.outgoing.send_error(request_id, error).await,
+        }
+    }
+
+    async fn handle_fs_create_directory(
+        &self,
+        request_id: ConnectionRequestId,
+        params: FsCreateDirectoryParams,
+    ) {
+        match self.fs_api.create_directory(params).await {
+            Ok(response) => self.outgoing.send_response(request_id, response).await,
+            Err(error) => self.outgoing.send_error(request_id, error).await,
+        }
+    }
+
+    async fn handle_fs_get_metadata(
+        &self,
+        request_id: ConnectionRequestId,
+        params: FsGetMetadataParams,
+    ) {
+        match self.fs_api.get_metadata(params).await {
+            Ok(response) => self.outgoing.send_response(request_id, response).await,
+            Err(error) => self.outgoing.send_error(request_id, error).await,
+        }
+    }
+
+    async fn handle_fs_read_directory(
+        &self,
+        request_id: ConnectionRequestId,
+        params: FsReadDirectoryParams,
+    ) {
+        match self.fs_api.read_directory(params).await {
+            Ok(response) => self.outgoing.send_response(request_id, response).await,
+            Err(error) => self.outgoing.send_error(request_id, error).await,
+        }
+    }
+
+    async fn handle_fs_remove(&self, request_id: ConnectionRequestId, params: FsRemoveParams) {
+        match self.fs_api.remove(params).await {
+            Ok(response) => self.outgoing.send_response(request_id, response).await,
+            Err(error) => self.outgoing.send_error(request_id, error).await,
+        }
+    }
+
+    async fn handle_fs_copy(&self, request_id: ConnectionRequestId, params: FsCopyParams) {
+        match self.fs_api.copy(params).await {
             Ok(response) => self.outgoing.send_response(request_id, response).await,
             Err(error) => self.outgoing.send_error(request_id, error).await,
         }

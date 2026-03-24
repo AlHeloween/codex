@@ -168,6 +168,14 @@
       "description": "Tool settings for a single app.",
       "type": "object"
     },
+    "ApprovalsReviewer": {
+      "description": "Configures who approval requests are routed to for review. Examples include sandbox escapes, blocked network access, MCP approval prompts, and ARC escalations. Defaults to `user`. `guardian_subagent` uses a carefully prompted subagent to gather relevant context and apply a risk-based decision framework before approving or denying the request.",
+      "enum": [
+        "user",
+        "guardian_subagent"
+      ],
+      "type": "string"
+    },
     "AppsConfigToml": {
       "additionalProperties": {
         "$ref": "#/definitions/AppConfig"
@@ -304,6 +312,9 @@
         "approval_policy": {
           "$ref": "#/definitions/AskForApproval"
         },
+        "approvals_reviewer": {
+          "$ref": "#/definitions/ApprovalsReviewer"
+        },
         "chatgpt_base_url": {
           "type": "string"
         },
@@ -327,9 +338,6 @@
             "apps": {
               "type": "boolean"
             },
-            "apps_mcp_gateway": {
-              "type": "boolean"
-            },
             "artifact": {
               "type": "boolean"
             },
@@ -337,6 +345,9 @@
               "type": "boolean"
             },
             "code_mode": {
+              "type": "boolean"
+            },
+            "code_mode_only": {
               "type": "boolean"
             },
             "codex_git_commit": {
@@ -411,22 +422,19 @@
             "multi_agent": {
               "type": "boolean"
             },
+            "multi_agent_v2": {
+              "type": "boolean"
+            },
             "personality": {
               "type": "boolean"
             },
             "plugins": {
               "type": "boolean"
             },
-            "powershell_utf8": {
-              "type": "boolean"
-            },
             "prevent_idle_sleep": {
               "type": "boolean"
             },
             "realtime_conversation": {
-              "type": "boolean"
-            },
-            "realtime_conversation_v2": {
               "type": "boolean"
             },
             "remote_models": {
@@ -478,6 +486,9 @@
               "type": "boolean"
             },
             "tool_suggest": {
+              "type": "boolean"
+            },
+            "tui_app_server": {
               "type": "boolean"
             },
             "undo": {
@@ -865,6 +876,12 @@
           "default": false,
           "description": "Whether this provider supports the Responses API WebSocket transport.",
           "type": "boolean"
+        },
+        "websocket_connect_timeout_ms": {
+          "description": "Maximum time (in milliseconds) to wait for a websocket connection attempt before treating it as failed.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
         },
         "wire_api": {
           "allOf": [
@@ -1342,6 +1359,32 @@
       },
       "type": "object"
     },
+    "RealtimeConversationVersion": {
+      "enum": [
+        "v1",
+        "v2"
+      ],
+      "type": "string"
+    },
+    "RealtimeToml": {
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "$ref": "#/definitions/RealtimeWsMode"
+        },
+        "version": {
+          "$ref": "#/definitions/RealtimeConversationVersion"
+        }
+      },
+      "type": "object"
+    },
+    "RealtimeWsMode": {
+      "enum": [
+        "conversational",
+        "transcription"
+      ],
+      "type": "string"
+    },
     "ReasoningEffort": {
       "description": "See https://platform.openai.com/docs/guides/reasoning?api-mode=responses#get-started-with-reasoning",
       "enum": [
@@ -1481,13 +1524,21 @@
         "enabled": {
           "type": "boolean"
         },
+        "name": {
+          "description": "Name-based selector.",
+          "type": "string"
+        },
         "path": {
-          "$ref": "#/definitions/AbsolutePathBuf"
+          "allOf": [
+            {
+              "$ref": "#/definitions/AbsolutePathBuf"
+            }
+          ],
+          "description": "Path-based selector."
         }
       },
       "required": [
-        "enabled",
-        "path"
+        "enabled"
       ],
       "type": "object"
     },
@@ -1505,6 +1556,42 @@
         }
       },
       "type": "object"
+    },
+    "ToolSuggestConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "discoverables": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/ToolSuggestDiscoverable"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "ToolSuggestDiscoverable": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "$ref": "#/definitions/ToolSuggestDiscoverableType"
+        }
+      },
+      "required": [
+        "id",
+        "type"
+      ],
+      "type": "object"
+    },
+    "ToolSuggestDiscoverableType": {
+      "enum": [
+        "connector",
+        "plugin"
+      ],
+      "type": "string"
     },
     "ToolsToml": {
       "additionalProperties": false,
@@ -1586,6 +1673,14 @@
         "status_line": {
           "default": null,
           "description": "Ordered list of status line item identifiers.\n\nWhen set, the TUI renders the selected items as the status line. When unset, the TUI defaults to: `model-with-reasoning`, `context-remaining`, and `current-dir`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "terminal_title": {
+          "default": null,
+          "description": "Ordered list of terminal title item identifiers.\n\nWhen set, the TUI renders the selected items into the terminal window/tab title. When unset, the TUI defaults to: `spinner` and `project`.",
           "items": {
             "type": "string"
           },
@@ -1692,6 +1787,10 @@
       "properties": {
         "sandbox": {
           "$ref": "#/definitions/WindowsSandboxModeToml"
+        },
+        "sandbox_private_desktop": {
+          "description": "Defaults to `true`. Set to `false` to launch the final sandboxed child process on `Winsta0\\\\Default` instead of a private desktop.",
+          "type": "boolean"
         }
       },
       "type": "object"
@@ -1738,6 +1837,14 @@
         }
       ],
       "description": "Default approval policy for executing commands."
+    },
+    "approvals_reviewer": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/ApprovalsReviewer"
+        }
+      ],
+      "description": "Configures who approval requests are routed to for review once they have been escalated. This does not disable separate safety checks such as ARC."
     },
     "apps": {
       "allOf": [
@@ -1804,6 +1911,10 @@
     "experimental_compact_prompt_file": {
       "$ref": "#/definitions/AbsolutePathBuf"
     },
+    "experimental_exec_server_url": {
+      "description": "Experimental / do not use. Overrides the URL used when connecting to a remote exec server.",
+      "type": "string"
+    },
     "experimental_realtime_start_instructions": {
       "description": "Experimental / do not use. Replaces the built-in realtime start instructions inserted into developer messages when realtime becomes active.",
       "type": "string"
@@ -1841,9 +1952,6 @@
         "apps": {
           "type": "boolean"
         },
-        "apps_mcp_gateway": {
-          "type": "boolean"
-        },
         "artifact": {
           "type": "boolean"
         },
@@ -1851,6 +1959,9 @@
           "type": "boolean"
         },
         "code_mode": {
+          "type": "boolean"
+        },
+        "code_mode_only": {
           "type": "boolean"
         },
         "codex_git_commit": {
@@ -1925,22 +2036,19 @@
         "multi_agent": {
           "type": "boolean"
         },
+        "multi_agent_v2": {
+          "type": "boolean"
+        },
         "personality": {
           "type": "boolean"
         },
         "plugins": {
           "type": "boolean"
         },
-        "powershell_utf8": {
-          "type": "boolean"
-        },
         "prevent_idle_sleep": {
           "type": "boolean"
         },
         "realtime_conversation": {
-          "type": "boolean"
-        },
-        "realtime_conversation_v2": {
           "type": "boolean"
         },
         "remote_models": {
@@ -1992,6 +2100,9 @@
           "type": "boolean"
         },
         "tool_suggest": {
+          "type": "boolean"
+        },
+        "tui_app_server": {
           "type": "boolean"
         },
         "undo": {
@@ -2174,7 +2285,7 @@
         "$ref": "#/definitions/ModelProviderInfo"
       },
       "default": {},
-      "description": "User-defined provider entries that extend/override the built-in list.",
+      "description": "User-defined provider entries that extend the built-in list. Built-in IDs cannot be overridden.",
       "type": "object"
     },
     "model_reasoning_effort": {
@@ -2210,6 +2321,10 @@
         "type": "string"
       },
       "type": "array"
+    },
+    "openai_base_url": {
+      "description": "Base URL override for the built-in `openai` model provider.",
+      "type": "string"
     },
     "oss_provider": {
       "description": "Preferred OSS provider for local models, e.g. \"lmstudio\" or \"ollama\".",
@@ -2290,6 +2405,15 @@
       },
       "type": "object"
     },
+    "realtime": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/RealtimeToml"
+        }
+      ],
+      "default": null,
+      "description": "Experimental / do not use. Realtime websocket session selection. `version` controls v1/v2 and `type` controls conversational/transcription."
+    },
     "review_model": {
       "description": "Review model override used by the `/review` feature.",
       "type": "string"
@@ -2367,6 +2491,14 @@
       "format": "uint",
       "minimum": 0.0,
       "type": "integer"
+    },
+    "tool_suggest": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/ToolSuggestConfig"
+        }
+      ],
+      "description": "Additional discoverable tools that can be suggested for installation."
     },
     "tools": {
       "allOf": [

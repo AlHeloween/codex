@@ -1,9 +1,9 @@
 #![allow(clippy::unwrap_used)]
 
 use codex_apply_patch::APPLY_PATCH_TOOL_INSTRUCTIONS;
-use codex_core::features::Feature;
 use codex_core::shell::Shell;
 use codex_core::shell::default_user_shell;
+use codex_features::Feature;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::ReasoningSummary;
@@ -177,6 +177,11 @@ async fn prompt_tools_are_consistent_across_requests() -> anyhow::Result<()> {
         "apply_patch",
         "web_search",
         "view_image",
+        "spawn_agent",
+        "send_input",
+        "resume_agent",
+        "wait_agent",
+        "close_agent",
     ]);
     let body0 = req1.single_request().body_json();
 
@@ -423,6 +428,7 @@ async fn overrides_turn_context_but_keeps_cached_prefix_and_key_constant() -> an
         .submit(Op::OverrideTurnContext {
             cwd: None,
             approval_policy: Some(AskForApproval::Never),
+            approvals_reviewer: None,
             sandbox_policy: Some(new_policy.clone()),
             windows_sandbox_level: None,
             model: None,
@@ -505,6 +511,7 @@ async fn override_before_first_turn_emits_environment_context() -> anyhow::Resul
         .submit(Op::OverrideTurnContext {
             cwd: None,
             approval_policy: Some(AskForApproval::Never),
+            approvals_reviewer: None,
             sandbox_policy: None,
             windows_sandbox_level: None,
             model: Some("gpt-5.1-codex".to_string()),
@@ -696,6 +703,7 @@ async fn per_turn_overrides_keep_cached_prefix_and_key_constant() -> anyhow::Res
             }],
             cwd: new_cwd.path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: new_policy.clone(),
             model: "o3".to_string(),
             effort: Some(ReasoningEffort::High),
@@ -808,6 +816,7 @@ async fn send_user_turn_with_no_changes_does_not_send_environment_context() -> a
             }],
             cwd: default_cwd.clone(),
             approval_policy: default_approval_policy,
+            approvals_reviewer: None,
             sandbox_policy: default_sandbox_policy.clone(),
             model: default_model.clone(),
             effort: default_effort,
@@ -828,6 +837,7 @@ async fn send_user_turn_with_no_changes_does_not_send_environment_context() -> a
             }],
             cwd: default_cwd.clone(),
             approval_policy: default_approval_policy,
+            approvals_reviewer: None,
             sandbox_policy: default_sandbox_policy.clone(),
             model: default_model.clone(),
             effort: default_effort,
@@ -932,6 +942,7 @@ async fn send_user_turn_with_changes_sends_environment_context() -> anyhow::Resu
             }],
             cwd: default_cwd.clone(),
             approval_policy: default_approval_policy,
+            approvals_reviewer: None,
             sandbox_policy: default_sandbox_policy.clone(),
             model: default_model,
             effort: default_effort,
@@ -952,6 +963,7 @@ async fn send_user_turn_with_changes_sends_environment_context() -> anyhow::Resu
             }],
             cwd: default_cwd.clone(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::DangerFullAccess,
             model: "o3".to_string(),
             effort: Some(ReasoningEffort::High),

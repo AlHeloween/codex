@@ -1,11 +1,11 @@
 use super::*;
 use crate::codex::make_session_and_context;
 use crate::codex::make_session_and_context_with_dynamic_tools_and_rx;
-use crate::features::Feature;
 use crate::protocol::AskForApproval;
 use crate::protocol::EventMsg;
 use crate::protocol::SandboxPolicy;
 use crate::turn_diff_tracker::TurnDiffTracker;
+use codex_features::Feature;
 use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem;
 use codex_protocol::dynamic_tools::DynamicToolResponse;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
@@ -376,6 +376,7 @@ fn validate_emitted_image_url_rejects_non_data_scheme() {
 fn summarize_tool_call_response_for_multimodal_custom_output() {
     let response = ResponseInputItem::CustomToolCallOutput {
         call_id: "call-1".to_string(),
+        name: None,
         output: FunctionCallOutputPayload::from_content_items(vec![
             FunctionCallOutputContentItem::InputImage {
                 image_url: "data:image/png;base64,abcd".to_string(),
@@ -1851,6 +1852,7 @@ async fn js_repl_emit_image_rejects_mixed_content() -> anyhow::Result<()> {
                 "properties": {},
                 "additionalProperties": false
             }),
+            defer_loading: false,
         }])
         .await;
     if !turn
@@ -1949,6 +1951,7 @@ async fn js_repl_dynamic_tool_response_preserves_js_line_separator_text() -> any
                     "properties": {},
                     "additionalProperties": false
                 }),
+                defer_loading: false,
             }])
             .await;
 
@@ -2004,6 +2007,79 @@ console.log(text);
         let result = result?;
         assert_eq!(result.output, format!("true\n{expected_text}"));
     }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn js_repl_can_call_hidden_dynamic_tools() -> anyhow::Result<()> {
+    if !can_run_js_repl_runtime_tests().await {
+        return Ok(());
+    }
+
+    let (session, turn, rx_event) =
+        make_session_and_context_with_dynamic_tools_and_rx(vec![DynamicToolSpec {
+            name: "hidden_dynamic_tool".to_string(),
+            description: "A hidden dynamic tool.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "city": { "type": "string" }
+                },
+                "required": ["city"],
+                "additionalProperties": false
+            }),
+            defer_loading: true,
+        }])
+        .await;
+
+    *session.active_turn.lock().await = Some(crate::state::ActiveTurn::default());
+
+    let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::default()));
+    let manager = turn.js_repl.manager().await?;
+    let code = r#"
+const out = await codex.tool("hidden_dynamic_tool", { city: "Paris" });
+console.log(JSON.stringify(out));
+"#;
+
+    let session_for_response = Arc::clone(&session);
+    let response_watcher = async move {
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(2), rx_event.recv()).await??;
+            if let EventMsg::DynamicToolCallRequest(request) = event.msg {
+                session_for_response
+                    .notify_dynamic_tool_response(
+                        &request.call_id,
+                        DynamicToolResponse {
+                            content_items: vec![DynamicToolCallOutputContentItem::InputText {
+                                text: "hidden-ok".to_string(),
+                            }],
+                            success: true,
+                        },
+                    )
+                    .await;
+                return Ok::<(), anyhow::Error>(());
+            }
+        }
+    };
+
+    let (result, response_watcher_result) = tokio::join!(
+        manager.execute(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            tracker,
+            JsReplArgs {
+                code: code.to_string(),
+                timeout_ms: Some(15_000),
+            },
+        ),
+        response_watcher,
+    );
+
+    let result = result?;
+    response_watcher_result?;
+    assert!(result.output.contains("hidden-ok"));
+    assert!(session.get_pending_input().await.is_empty());
 
     Ok(())
 }

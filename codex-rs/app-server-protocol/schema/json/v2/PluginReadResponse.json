@@ -25,11 +25,15 @@
         },
         "name": {
           "type": "string"
+        },
+        "needsAuth": {
+          "type": "boolean"
         }
       },
       "required": [
         "id",
-        "name"
+        "name",
+        "needsAuth"
       ],
       "type": "object"
     },
@@ -125,8 +129,12 @@
           ]
         },
         "defaultPrompt": {
+          "description": "Starter prompts for the plugin. Capped at 3 entries with a maximum of 128 characters per entry.",
+          "items": {
+            "type": "string"
+          },
           "type": [
-            "string",
+            "array",
             "null"
           ]
         },
@@ -310,6 +318,9 @@
         "description": {
           "type": "string"
         },
+        "enabled": {
+          "type": "boolean"
+        },
         "interface": {
           "anyOf": [
             {
@@ -335,6 +346,7 @@
       },
       "required": [
         "description",
+        "enabled",
         "name",
         "path"
       ],
