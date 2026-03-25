@@ -1484,7 +1484,7 @@ dependencies = [
 
 [[package]]
 name = "codex-app-server-client"
-version = "0.0.0"
+version = "0.300.0"
 dependencies = [
  "codex-app-server",
  "codex-app-server-protocol",
@@ -1584,7 +1584,7 @@ dependencies = [
 
 [[package]]
 name = "codex-artifacts"
-version = "0.0.0"
+version = "0.300.0"
 dependencies = [
  "codex-package-manager",
  "flate2",
@@ -1806,7 +1806,7 @@ dependencies = [
 
 [[package]]
 name = "codex-code-mode"
-version = "0.0.0"
+version = "0.300.0"
 dependencies = [
  "async-trait",
  "pretty_assertions",
@@ -1843,7 +1843,7 @@ dependencies = [
 
 [[package]]
 name = "codex-connectors"
-version = "0.0.0"
+version = "0.300.0"
 dependencies = [
  "anyhow",
  "codex-app-server-protocol",
@@ -2026,7 +2026,7 @@ dependencies = [
 
 [[package]]
 name = "codex-exec-server"
-version = "0.0.0"
+version = "0.300.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2096,7 +2096,7 @@ dependencies = [
 
 [[package]]
 name = "codex-features"
-version = "0.0.0"
+version = "0.300.0"
 dependencies = [
  "codex-login",
  "codex-otel",
@@ -2138,7 +2138,7 @@ dependencies = [
 
 [[package]]
 name = "codex-git-utils"
-version = "0.0.0"
+version = "0.300.0"
 dependencies = [
  "assert_matches",
  "codex-utils-absolute-path",
@@ -2364,7 +2364,7 @@ dependencies = [
 
 [[package]]
 name = "codex-package-manager"
-version = "0.0.0"
+version = "0.300.0"
 dependencies = [
  "fd-lock",
  "flate2",
@@ -2469,7 +2469,7 @@ dependencies = [
 
 [[package]]
 name = "codex-sandboxing"
-version = "0.0.0"
+version = "0.300.0"
 dependencies = [
  "codex-network-proxy",
  "codex-protocol",
@@ -2591,7 +2591,7 @@ dependencies = [
 
 [[package]]
 name = "codex-terminal-detection"
-version = "0.0.0"
+version = "0.300.0"
 dependencies = [
  "pretty_assertions",
  "tracing",
@@ -2599,7 +2599,7 @@ dependencies = [
 
 [[package]]
 name = "codex-test-macros"
-version = "0.0.0"
+version = "0.300.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2703,7 +2703,7 @@ dependencies = [
 
 [[package]]
 name = "codex-tui-app-server"
-version = "0.0.0"
+version = "0.300.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -2947,7 +2947,7 @@ dependencies = [
 
 [[package]]
 name = "codex-utils-stream-parser"
-version = "0.0.0"
+version = "0.300.0"
 dependencies = [
  "pretty_assertions",
 ]
@@ -2962,7 +2962,7 @@ dependencies = [
 
 [[package]]
 name = "codex-v8-poc"
-version = "0.0.0"
+version = "0.300.0"
 dependencies = [
  "pretty_assertions",
  "v8",
