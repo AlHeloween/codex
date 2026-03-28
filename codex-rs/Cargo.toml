@@ -382,7 +382,7 @@ ignored = [
 ]
 
 [profile.release]
-lto = "fat"
+lto = false
 split-debuginfo = "off"
 # Because we bundle some of these executables with the TypeScript CLI, we
 # remove everything to make the binary as small as possible.
@@ -390,11 +390,15 @@ strip = "symbols"
 
 # See https://github.com/openai/codex/issues/1411 for details.
 codegen-units = 1
+debug = 0
 
 [profile.ci-test]
 debug = 1         # Reduce debug symbol size
 inherits = "test"
 opt-level = 0
+
+[profile.dev]
+codegen-units = 1
 
 [patch.crates-io]
 # Uncomment to debug local changes.
