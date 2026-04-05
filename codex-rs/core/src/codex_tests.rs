@@ -283,6 +283,23 @@ fn developer_input_texts(items: &[ResponseItem]) -> Vec<&str> {
         .collect()
 }
 
+fn user_input_texts(items: &[ResponseItem]) -> Vec<&str> {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            ResponseItem::Message { role, content, .. } if role == "user" => {
+                Some(content.as_slice())
+            }
+            _ => None,
+        })
+        .flat_map(|content| content.iter())
+        .filter_map(|item| match item {
+            ContentItem::InputText { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
 fn test_tool_runtime(session: Arc<Session>, turn_context: Arc<TurnContext>) -> ToolCallRuntime {
     let router = Arc::new(ToolRouter::from_config(
         &turn_context.tools_config,
@@ -1826,6 +1843,7 @@ async fn set_rate_limits_retains_previous_credits() {
         original_config_do_not_use: Arc::clone(&config),
         metrics_service_name: None,
         app_server_client_name: None,
+        app_server_client_version: None,
         session_source: SessionSource::Exec,
         dynamic_tools: Vec::new(),
         persist_extended_history: false,
@@ -1927,6 +1945,7 @@ async fn set_rate_limits_updates_plan_type_when_present() {
         original_config_do_not_use: Arc::clone(&config),
         metrics_service_name: None,
         app_server_client_name: None,
+        app_server_client_version: None,
         session_source: SessionSource::Exec,
         dynamic_tools: Vec::new(),
         persist_extended_history: false,
@@ -2275,6 +2294,7 @@ pub(crate) async fn make_session_configuration_for_tests() -> SessionConfigurati
         original_config_do_not_use: Arc::clone(&config),
         metrics_service_name: None,
         app_server_client_name: None,
+        app_server_client_version: None,
         session_source: SessionSource::Exec,
         dynamic_tools: Vec::new(),
         persist_extended_history: false,
@@ -2540,6 +2560,7 @@ async fn session_new_fails_when_zsh_fork_enabled_without_zsh_path() {
         original_config_do_not_use: Arc::clone(&config),
         metrics_service_name: None,
         app_server_client_name: None,
+        app_server_client_version: None,
         session_source: SessionSource::Exec,
         dynamic_tools: Vec::new(),
         persist_extended_history: false,
@@ -2640,6 +2661,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         original_config_do_not_use: Arc::clone(&config),
         metrics_service_name: None,
         app_server_client_name: None,
+        app_server_client_version: None,
         session_source: SessionSource::Exec,
         dynamic_tools: Vec::new(),
         persist_extended_history: false,
@@ -3479,6 +3501,7 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
         original_config_do_not_use: Arc::clone(&config),
         metrics_service_name: None,
         app_server_client_name: None,
+        app_server_client_version: None,
         session_source: SessionSource::Exec,
         dynamic_tools,
         persist_extended_history: false,
@@ -3774,17 +3797,9 @@ async fn build_settings_update_items_emits_environment_item_for_network_changes(
         .build_settings_update_items(Some(&reference_context_item), &current_context)
         .await;
 
-    let environment_update = update_items
-        .iter()
-        .find_map(|item| match item {
-            ResponseItem::Message { role, content, .. } if role == "user" => {
-                let [ContentItem::InputText { text }] = content.as_slice() else {
-                    return None;
-                };
-                text.contains("<environment_context>").then_some(text)
-            }
-            _ => None,
-        })
+    let environment_update = user_input_texts(&update_items)
+        .into_iter()
+        .find(|text| text.contains("<environment_context>"))
         .expect("environment update item should be emitted");
     assert!(environment_update.contains("<network enabled=\"true\">"));
     assert!(environment_update.contains("<allowed>api.example.com</allowed>"));
@@ -3809,20 +3824,41 @@ async fn build_settings_update_items_emits_environment_item_for_time_changes() {
         .build_settings_update_items(Some(&reference_context_item), &current_context)
         .await;
 
-    let environment_update = update_items
-        .iter()
-        .find_map(|item| match item {
-            ResponseItem::Message { role, content, .. } if role == "user" => {
-                let [ContentItem::InputText { text }] = content.as_slice() else {
-                    return None;
-                };
-                text.contains("<environment_context>").then_some(text)
-            }
-            _ => None,
-        })
+    let environment_update = user_input_texts(&update_items)
+        .into_iter()
+        .find(|text| text.contains("<environment_context>"))
         .expect("environment update item should be emitted");
     assert!(environment_update.contains("<current_date>2026-02-27</current_date>"));
     assert!(environment_update.contains("<timezone>Europe/Berlin</timezone>"));
+}
+
+#[tokio::test]
+async fn build_settings_update_items_omits_environment_item_when_disabled() {
+    let (session, previous_context) = make_session_and_context().await;
+    let previous_context = Arc::new(previous_context);
+    let mut current_context = previous_context
+        .with_model(
+            previous_context.model_info.slug.clone(),
+            &session.services.models_manager,
+        )
+        .await;
+    let mut config = (*current_context.config).clone();
+    config.include_environment_context = false;
+    current_context.config = Arc::new(config);
+    current_context.current_date = Some("2026-02-27".to_string());
+
+    let reference_context_item = previous_context.to_turn_context_item();
+    let update_items = session
+        .build_settings_update_items(Some(&reference_context_item), &current_context)
+        .await;
+
+    let user_texts = user_input_texts(&update_items);
+    assert!(
+        !user_texts
+            .iter()
+            .any(|text| text.contains("<environment_context>")),
+        "did not expect environment context updates when disabled, got {user_texts:?}"
+    );
 }
 
 #[tokio::test]
