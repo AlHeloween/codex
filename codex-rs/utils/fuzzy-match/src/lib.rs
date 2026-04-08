@@ -1,14 +1,63 @@
-/// Simple case-insensitive subsequence matcher used for fuzzy filtering.
+//! # Fuzzy Match Utility
+//!
+//! This module provides a simple case-insensitive subsequence matcher used for
+//! fuzzy filtering in various parts of the Codex TUI, such as skill search and
+//! slash command filtering.
+//!
+//! ## Architecture
+//!
+//! The fuzzy matcher is a low-level utility designed to be fast and Unicode-aware.
+//! It is decoupled from any UI logic and can be used in any context where
+//! subsequence matching is required.
+//!
+//! ## Design Patterns
+//!
+//! - **Greedy Matching**: The algorithm uses a simple greedy approach to find the
+//!   first occurrence of each character in the needle within the haystack.
+//! - **Unicode Mapping**: To handle Unicode correctly (especially characters that
+//!   expand when lowercased), it maintains an explicit mapping between normalized
+//!   characters and their original source indices.
+
+/// Performs a case-insensitive fuzzy match of a needle against a haystack.
 ///
-/// Returns the indices (character positions) of the matched characters in the
-/// ORIGINAL `haystack` string and a score where smaller is better.
+/// This function determines if the characters in `needle` appear as a subsequence
+/// within `haystack`, regardless of case. It returns the character indices of
+/// the match and a score representing the quality of the match.
 ///
-/// Unicode correctness: we perform the match on a lowercased copy of the
-/// haystack and needle but maintain a mapping from each character in the
-/// lowercased haystack back to the original character index in `haystack`.
-/// This ensures the returned indices can be safely used with
-/// `str::chars().enumerate()` consumers for highlighting, even when
-/// lowercasing expands certain characters (e.g., ß → ss, İ → i̇).
+/// Args:
+///     haystack (&str): The string to search within.
+///     needle (&str): The sequence of characters to find.
+///
+/// Returns:
+///     Option<(Vec<usize>, i32)>:
+///         Some((indices, score)):
+///             indices: A sorted list of unique character positions in the original haystack.
+///             score: A ranking metric where smaller is better.
+///         None: If no match is found.
+///
+/// Logic:
+///     The algorithm performs a greedy subsequence search after normalizing both
+///     inputs to lowercase. It maintains an internal mapping from normalized
+///     character positions back to original `haystack` indices to handle Unicode
+///     characters that expand during lowercasing (e.g., 'İ' expanding to 'i' + '̇').
+///
+/// Complexity:
+///     Time Complexity: O(N + M), where N is the length of the haystack and M
+///         is the length of the needle.
+///     Space Complexity: O(N + M) for storing normalized characters and mappings.
+///
+/// Exceptions:
+///     - Returns `Some((Vec::new(), i32::MAX))` if the needle is empty.
+///     - Returns `None` if the needle characters do not appear in order.
+///
+/// Example:
+///
+/// ```rust
+/// use codex_utils_fuzzy_match::fuzzy_match;
+///
+/// let (indices, score) = fuzzy_match("hello", "hl").unwrap();
+/// assert_eq!(indices, vec![0, 2]);
+/// ```
 pub fn fuzzy_match(haystack: &str, needle: &str) -> Option<(Vec<usize>, i32)> {
     if needle.is_empty() {
         return Some((Vec::new(), i32::MAX));
@@ -68,7 +117,25 @@ pub fn fuzzy_match(haystack: &str, needle: &str) -> Option<(Vec<usize>, i32)> {
     Some((result_orig_indices, score))
 }
 
-/// Convenience wrapper to get only the indices for a fuzzy match.
+/// Convenience wrapper that returns only the matched indices.
+///
+/// Use this when the match score is not needed.
+///
+/// Args:
+///     haystack (&str): The string to search within.
+///     needle (&str): The sequence of characters to find.
+///
+/// Returns:
+///     Option<Vec<usize>>: Sorted list of indices if matched, else None.
+///
+/// Example:
+///
+/// ```rust
+/// use codex_utils_fuzzy_match::fuzzy_indices;
+///
+/// let indices = fuzzy_indices("hello", "hl").unwrap();
+/// assert_eq!(indices, vec![0, 2]);
+/// ```
 pub fn fuzzy_indices(haystack: &str, needle: &str) -> Option<Vec<usize>> {
     fuzzy_match(haystack, needle).map(|(mut idx, _)| {
         idx.sort_unstable();
