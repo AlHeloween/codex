@@ -339,6 +339,9 @@ pub struct ConfigToml {
     /// Suppress warnings about unstable (under development) features.
     pub suppress_unstable_features_warning: Option<bool>,
 
+    /// Suppress the "high-risk cyber activity" model downgrade warning message.
+    pub suppress_cyber_safety_warning: Option<bool>,
+
     /// Settings for ghost snapshots (used for undo).
     #[serde(default)]
     pub ghost_snapshot: Option<GhostSnapshotToml>,
