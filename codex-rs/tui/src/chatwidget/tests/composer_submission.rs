@@ -398,8 +398,8 @@ async fn submission_prefers_selected_duplicate_skill_path() {
     });
     drain_insert_history(&mut rx);
 
-    let repo_skill_path = PathBuf::from("/tmp/repo/figma/SKILL.md");
-    let user_skill_path = PathBuf::from("/tmp/user/figma/SKILL.md");
+    let repo_skill_path = test_path_buf("/tmp/repo/figma/SKILL.md").abs();
+    let user_skill_path = test_path_buf("/tmp/user/figma/SKILL.md").abs();
     chat.set_skills(Some(vec![
         SkillMetadata {
             name: "figma".to_string(),
@@ -445,7 +445,7 @@ async fn submission_prefers_selected_duplicate_skill_path() {
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(selected_skill_paths, vec![user_skill_path]);
+    assert_eq!(selected_skill_paths, vec![user_skill_path.to_path_buf()]);
 }
 
 #[tokio::test]
@@ -618,6 +618,8 @@ async fn interrupted_turn_restore_keeps_active_mode_for_resubmission() {
         msg: EventMsg::TurnAborted(codex_protocol::protocol::TurnAbortedEvent {
             turn_id: Some("turn-1".to_string()),
             reason: TurnAbortReason::Interrupted,
+            completed_at: None,
+            duration_ms: None,
         }),
     });
 
@@ -1040,6 +1042,8 @@ async fn interrupt_restores_queued_messages_into_composer() {
         msg: EventMsg::TurnAborted(codex_protocol::protocol::TurnAbortedEvent {
             turn_id: Some("turn-1".to_string()),
             reason: TurnAbortReason::Interrupted,
+            completed_at: None,
+            duration_ms: None,
         }),
     });
 
@@ -1079,6 +1083,8 @@ async fn interrupt_prepends_queued_messages_before_existing_composer_text() {
         msg: EventMsg::TurnAborted(codex_protocol::protocol::TurnAbortedEvent {
             turn_id: Some("turn-1".to_string()),
             reason: TurnAbortReason::Interrupted,
+            completed_at: None,
+            duration_ms: None,
         }),
     });
 

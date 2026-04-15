@@ -245,10 +245,10 @@ async fn session_configured_syncs_widget_config_permissions_and_cwd() {
         .sandbox_policy
         .set(SandboxPolicy::new_workspace_write_policy())
         .expect("set sandbox policy");
-    chat.config.cwd = PathBuf::from("/home/user/main").abs();
+    chat.config.cwd = test_path_buf("/home/user/main").abs();
 
     let expected_sandbox = SandboxPolicy::new_read_only_policy();
-    let expected_cwd = PathBuf::from("/home/user/sub-agent").abs();
+    let expected_cwd = test_path_buf("/home/user/sub-agent").abs();
     let configured = codex_protocol::protocol::SessionConfiguredEvent {
         session_id: ThreadId::new(),
         forked_from_id: None,
@@ -392,7 +392,9 @@ async fn forked_thread_history_line_includes_name_and_id_snapshot() {
     let (chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     let mut chat = chat;
     let temp = tempdir().expect("tempdir");
-    chat.config.codex_home = temp.path().to_path_buf();
+    chat.config.codex_home =
+        codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(temp.path())
+            .expect("temp dir is absolute");
 
     let forked_from_id =
         ThreadId::from_string("e9f18a88-8081-4e51-9d4e-8af5cde2d8dd").expect("forked id");
@@ -429,7 +431,9 @@ async fn forked_thread_history_line_without_name_shows_id_once_snapshot() {
     let (chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     let mut chat = chat;
     let temp = tempdir().expect("tempdir");
-    chat.config.codex_home = temp.path().to_path_buf();
+    chat.config.codex_home =
+        codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(temp.path())
+            .expect("temp dir is absolute");
 
     let forked_from_id =
         ThreadId::from_string("019c2d47-4935-7423-a190-05691f566092").expect("forked id");
@@ -536,6 +540,9 @@ async fn replayed_retryable_app_server_error_keeps_turn_running() {
                 items: Vec::new(),
                 status: AppServerTurnStatus::InProgress,
                 error: None,
+                started_at: Some(0),
+                completed_at: None,
+                duration_ms: None,
             },
         }),
         Some(ReplayKind::ThreadSnapshot),
@@ -686,6 +693,9 @@ async fn live_reasoning_summary_is_not_rendered_twice_when_item_completes() {
                 items: Vec::new(),
                 status: AppServerTurnStatus::InProgress,
                 error: None,
+                started_at: Some(0),
+                completed_at: None,
+                duration_ms: None,
             },
         }),
         /*replay_kind*/ None,
@@ -731,6 +741,7 @@ async fn replayed_turn_started_does_not_mark_task_running() {
 
     chat.replay_initial_messages(vec![EventMsg::TurnStarted(TurnStartedEvent {
         turn_id: "turn-1".to_string(),
+        started_at: None,
         model_context_window: None,
         collaboration_mode_kind: ModeKind::Default,
     })]);
@@ -747,6 +758,7 @@ async fn thread_snapshot_replayed_turn_started_marks_task_running() {
         id: "turn-1".into(),
         msg: EventMsg::TurnStarted(TurnStartedEvent {
             turn_id: "turn-1".to_string(),
+            started_at: None,
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
         }),
@@ -771,6 +783,9 @@ async fn replayed_in_progress_turn_marks_task_running() {
             items: Vec::new(),
             status: AppServerTurnStatus::InProgress,
             error: None,
+            started_at: None,
+            completed_at: None,
+            duration_ms: None,
         }],
         ReplayKind::ResumeInitialMessages,
     );
@@ -813,6 +828,7 @@ async fn thread_snapshot_replayed_stream_recovery_restores_previous_status_heade
         id: "task".into(),
         msg: EventMsg::TurnStarted(TurnStartedEvent {
             turn_id: "turn-1".to_string(),
+            started_at: None,
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
         }),
@@ -853,6 +869,7 @@ async fn resume_replay_interrupted_reconnect_does_not_leave_stale_working_state(
     chat.replay_initial_messages(vec![
         EventMsg::TurnStarted(TurnStartedEvent {
             turn_id: "turn-1".to_string(),
+            started_at: None,
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
         }),
@@ -884,6 +901,7 @@ async fn replayed_interrupted_reconnect_footer_row_snapshot() {
     chat.replay_initial_messages(vec![
         EventMsg::TurnStarted(TurnStartedEvent {
             turn_id: "turn-1".to_string(),
+            started_at: None,
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
         }),
@@ -909,6 +927,7 @@ async fn stream_recovery_restores_previous_status_header() {
         id: "task".into(),
         msg: EventMsg::TurnStarted(TurnStartedEvent {
             turn_id: "turn-1".to_string(),
+            started_at: None,
             model_context_window: None,
             collaboration_mode_kind: ModeKind::Default,
         }),

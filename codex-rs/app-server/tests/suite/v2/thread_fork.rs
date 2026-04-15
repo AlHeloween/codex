@@ -24,7 +24,7 @@ use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::UserInput;
-use codex_login::AuthCredentialsStoreMode;
+use codex_config::types::AuthCredentialsStoreMode;
 use codex_login::REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
@@ -205,7 +205,7 @@ async fn thread_fork_tracks_thread_initialized_analytics() -> Result<()> {
         /*git_info*/ None,
     )?;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = McpProcess::new_without_managed_config(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let fork_id = mcp
@@ -565,7 +565,7 @@ fn create_config_toml_with_chatgpt_base_url(
     let general_analytics_toml = if general_analytics_enabled {
         "\ngeneral_analytics = true".to_string()
     } else {
-        String::new()
+        "\ngeneral_analytics = false".to_string()
     };
     let config_toml = codex_home.join("config.toml");
     std::fs::write(
