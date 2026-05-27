@@ -10,8 +10,6 @@ use codex_app_server_protocol::ThreadStatus;
 use codex_app_server_protocol::ThreadStatusChangedNotification;
 use codex_protocol::ThreadId;
 use std::collections::HashMap;
-#[cfg(test)]
-use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 #[cfg(test)]
@@ -455,6 +453,8 @@ fn loaded_thread_status(runtime: &RuntimeFacts) -> ThreadStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_utils_absolute_path::test_support::PathBufExt;
+    use codex_utils_absolute_path::test_support::test_path_buf;
     use pretty_assertions::assert_eq;
     use tokio::time::Duration;
     use tokio::time::timeout;
@@ -722,6 +722,7 @@ mod tests {
         let (outgoing_tx, mut outgoing_rx) = mpsc::channel(8);
         let manager = ThreadWatchManager::new_with_outgoing(Arc::new(OutgoingMessageSender::new(
             outgoing_tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
         )));
 
         manager
@@ -764,6 +765,7 @@ mod tests {
         let (outgoing_tx, mut outgoing_rx) = mpsc::channel(8);
         let manager = ThreadWatchManager::new_with_outgoing(Arc::new(OutgoingMessageSender::new(
             outgoing_tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
         )));
 
         manager
@@ -887,6 +889,7 @@ mod tests {
     fn test_thread(thread_id: &str, source: codex_app_server_protocol::SessionSource) -> Thread {
         Thread {
             id: thread_id.to_string(),
+            session_id: thread_id.to_string(),
             forked_from_id: None,
             preview: String::new(),
             ephemeral: false,
@@ -895,11 +898,12 @@ mod tests {
             updated_at: 0,
             status: ThreadStatus::NotLoaded,
             path: None,
-            cwd: PathBuf::from("/tmp"),
+            cwd: test_path_buf("/tmp").abs(),
             cli_version: "test".to_string(),
             agent_nickname: None,
             agent_role: None,
             source,
+            thread_source: None,
             git_info: None,
             name: None,
             turns: Vec::new(),

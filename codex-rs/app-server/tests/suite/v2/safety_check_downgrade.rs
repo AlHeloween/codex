@@ -1,11 +1,16 @@
 use anyhow::Result;
 use app_test_support::McpProcess;
 use app_test_support::to_response;
+use codex_app_server_protocol::CodexErrorInfo;
+use codex_app_server_protocol::ErrorNotification;
 use codex_app_server_protocol::ItemCompletedNotification;
 use codex_app_server_protocol::ItemStartedNotification;
 use codex_app_server_protocol::JSONRPCMessage;
-use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::JSONRPCResponse;
+use codex_app_server_protocol::ModelRerouteReason;
+use codex_app_server_protocol::ModelReroutedNotification;
+use codex_app_server_protocol::ModelVerification;
+use codex_app_server_protocol::ModelVerificationNotification;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadStartParams;
@@ -18,13 +23,17 @@ use core_test_support::skip_if_no_network;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 use tokio::time::timeout;
+use wiremock::ResponseTemplate;
 
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-const REQUESTED_MODEL: &str = "gpt-5.1-codex-max";
-const SERVER_MODEL: &str = "gpt-5.2-codex";
+const REQUESTED_MODEL: &str = "gpt-5.4";
+const SERVER_MODEL: &str = "gpt-5.3-codex";
+const TRUSTED_ACCESS_FOR_CYBER_VERIFICATION: &str = "trusted_access_for_cyber";
+const CYBER_POLICY_MESSAGE: &str =
+    "This request has been flagged for potentially high-risk cyber activity.";
 
 #[tokio::test]
-async fn openai_model_header_mismatch_emits_warning_item_v2() -> Result<()> {
+async fn openai_model_header_mismatch_emits_model_rerouted_notification_v2() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
@@ -65,64 +74,99 @@ async fn openai_model_header_mismatch_emits_warning_item_v2() -> Result<()> {
             ..Default::default()
         })
         .await?;
-    let _turn_resp: JSONRPCResponse = timeout(
+    let turn_resp: JSONRPCResponse = timeout(
         DEFAULT_READ_TIMEOUT,
         mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
     )
     .await??;
-    let _turn_start: TurnStartResponse = to_response(_turn_resp)?;
+    let turn_start: TurnStartResponse = to_response(turn_resp)?;
 
-    let warning_started = timeout(DEFAULT_READ_TIMEOUT, async {
-        loop {
-            let notification: JSONRPCNotification = mcp
-                .read_stream_until_notification_message("item/started")
-                .await?;
-            let params = notification.params.expect("item/started params");
-            let started: ItemStartedNotification =
-                serde_json::from_value(params).expect("deserialize item/started");
-            if warning_text_from_item(&started.item).is_some_and(is_cyber_model_warning_text) {
-                return Ok::<ItemStartedNotification, anyhow::Error>(started);
-            }
-        }
-    })
-    .await??;
-
-    let warning_text =
-        warning_text_from_item(&warning_started.item).expect("expected warning user message item");
-    assert!(warning_text.contains("Warning:"));
-    assert!(warning_text.contains("gpt-5.2 as a fallback"));
-    assert!(warning_text.contains("regain access to gpt-5.3-codex"));
-
-    let warning_completed = timeout(DEFAULT_READ_TIMEOUT, async {
-        loop {
-            let notification: JSONRPCNotification = mcp
-                .read_stream_until_notification_message("item/completed")
-                .await?;
-            let params = notification.params.expect("item/completed params");
-            let completed: ItemCompletedNotification =
-                serde_json::from_value(params).expect("deserialize item/completed");
-            if warning_text_from_item(&completed.item).is_some_and(is_cyber_model_warning_text) {
-                return Ok::<ItemCompletedNotification, anyhow::Error>(completed);
-            }
-        }
-    })
-    .await??;
+    let rerouted = collect_turn_notifications_and_validate_no_warning_item(&mut mcp).await?;
     assert_eq!(
-        warning_text_from_item(&warning_completed.item),
-        warning_text_from_item(&warning_started.item)
+        rerouted,
+        ModelReroutedNotification {
+            thread_id: thread.id,
+            turn_id: turn_start.turn.id,
+            from_model: REQUESTED_MODEL.to_string(),
+            to_model: SERVER_MODEL.to_string(),
+            reason: ModelRerouteReason::HighRiskCyberActivity,
+        }
     );
-
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_notification_message("turn/completed"),
-    )
-    .await??;
 
     Ok(())
 }
 
 #[tokio::test]
-async fn response_model_field_mismatch_emits_warning_item_v2_when_header_matches_requested()
+async fn cyber_policy_response_emits_typed_error_notification_v2() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let response = ResponseTemplate::new(400).set_body_json(serde_json::json!({
+        "error": {
+            "message": CYBER_POLICY_MESSAGE,
+            "type": "invalid_request",
+            "param": null,
+            "code": "cyber_policy"
+        }
+    }));
+    let _response_mock = responses::mount_response_once(&server, response).await;
+
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri(), false)?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let thread_req = mcp
+        .send_thread_start_request(ThreadStartParams {
+            model: Some(REQUESTED_MODEL.to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let thread_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(thread_req)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(thread_resp)?;
+
+    let turn_req = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            input: vec![UserInput::Text {
+                text: "trigger cyber policy error".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    let turn_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
+    )
+    .await??;
+    let turn_start: TurnStartResponse = to_response(turn_resp)?;
+
+    let error = collect_cyber_policy_error_and_validate_no_reroute(&mut mcp).await?;
+    assert_eq!(
+        error,
+        ErrorNotification {
+            error: codex_app_server_protocol::TurnError {
+                message: CYBER_POLICY_MESSAGE.to_string(),
+                codex_error_info: Some(CodexErrorInfo::CyberPolicy),
+                additional_details: None,
+            },
+            will_retry: false,
+            thread_id: thread.id,
+            turn_id: turn_start.turn.id,
+        }
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn response_model_field_mismatch_emits_model_rerouted_notification_v2_when_header_matches_requested()
 -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -132,7 +176,9 @@ async fn response_model_field_mismatch_emits_warning_item_v2_when_header_matches
             "type": "response.created",
             "response": {
                 "id": "resp-1",
-                "model": SERVER_MODEL,
+                "headers": {
+                    "OpenAI-Model": SERVER_MODEL
+                }
             }
         }),
         responses::ev_assistant_message("msg-1", "Done"),
@@ -175,56 +221,92 @@ async fn response_model_field_mismatch_emits_warning_item_v2_when_header_matches
         mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
     )
     .await??;
-    let _turn_start: TurnStartResponse = to_response(turn_resp)?;
+    let turn_start: TurnStartResponse = to_response(turn_resp)?;
 
-    let warning_started = timeout(DEFAULT_READ_TIMEOUT, async {
-        loop {
-            let notification: JSONRPCNotification = mcp
-                .read_stream_until_notification_message("item/started")
-                .await?;
-            let params = notification.params.expect("item/started params");
-            let started: ItemStartedNotification =
-                serde_json::from_value(params).expect("deserialize item/started");
-            if warning_text_from_item(&started.item).is_some_and(is_cyber_model_warning_text) {
-                return Ok::<ItemStartedNotification, anyhow::Error>(started);
-            }
-        }
-    })
-    .await??;
-    let warning_text =
-        warning_text_from_item(&warning_started.item).expect("expected warning user message item");
-    assert!(warning_text.contains("gpt-5.2 as a fallback"));
-
-    let warning_completed = timeout(DEFAULT_READ_TIMEOUT, async {
-        loop {
-            let notification: JSONRPCNotification = mcp
-                .read_stream_until_notification_message("item/completed")
-                .await?;
-            let params = notification.params.expect("item/completed params");
-            let completed: ItemCompletedNotification =
-                serde_json::from_value(params).expect("deserialize item/completed");
-            if warning_text_from_item(&completed.item).is_some_and(is_cyber_model_warning_text) {
-                return Ok::<ItemCompletedNotification, anyhow::Error>(completed);
-            }
-        }
-    })
-    .await??;
+    let rerouted = collect_turn_notifications_and_validate_no_warning_item(&mut mcp).await?;
     assert_eq!(
-        warning_text_from_item(&warning_completed.item),
-        warning_text_from_item(&warning_started.item)
+        rerouted,
+        ModelReroutedNotification {
+            thread_id: thread.id,
+            turn_id: turn_start.turn.id,
+            from_model: REQUESTED_MODEL.to_string(),
+            to_model: SERVER_MODEL.to_string(),
+            reason: ModelRerouteReason::HighRiskCyberActivity,
+        }
     );
-
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_notification_message("turn/completed"),
-    )
-    .await??;
 
     Ok(())
 }
 
 #[tokio::test]
-async fn suppress_cyber_safety_warning_hides_warning_item_v2() -> Result<()> {
+async fn model_verification_emits_typed_notification_and_warning_v2() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let body = responses::sse(vec![
+        responses::ev_response_created("resp-1"),
+        responses::ev_model_verification_metadata(
+            "resp-1",
+            vec![TRUSTED_ACCESS_FOR_CYBER_VERIFICATION],
+        ),
+        responses::ev_assistant_message("msg-1", "Done"),
+        responses::ev_completed("resp-1"),
+    ]);
+    let response = responses::sse_response(body);
+    let _response_mock = responses::mount_response_once(&server, response).await;
+
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri(), false)?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let thread_req = mcp
+        .send_thread_start_request(ThreadStartParams {
+            model: Some(REQUESTED_MODEL.to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let thread_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(thread_req)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(thread_resp)?;
+
+    let turn_req = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            input: vec![UserInput::Text {
+                text: "trigger model verification".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    let turn_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
+    )
+    .await??;
+    let turn_start: TurnStartResponse = to_response(turn_resp)?;
+
+    let verification =
+        collect_model_verification_notifications_and_validate_no_warning_item(&mut mcp).await?;
+    assert_eq!(
+        verification,
+        ModelVerificationNotification {
+            thread_id: thread.id,
+            turn_id: turn_start.turn.id,
+            verifications: vec![ModelVerification::TrustedAccessForCyber],
+        }
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn suppress_cyber_safety_warning_hides_warning_notification_v2() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
@@ -265,37 +347,23 @@ async fn suppress_cyber_safety_warning_hides_warning_item_v2() -> Result<()> {
             ..Default::default()
         })
         .await?;
-    let _turn_resp: JSONRPCResponse = timeout(
+    let turn_resp: JSONRPCResponse = timeout(
         DEFAULT_READ_TIMEOUT,
         mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
     )
     .await??;
-    let _turn_start: TurnStartResponse = to_response(_turn_resp)?;
+    let _turn_start: TurnStartResponse = to_response(turn_resp)?;
 
-    // This is a negative assertion: ensure we reach turn completion without seeing
-    // a cyber safety warning item.
     timeout(DEFAULT_READ_TIMEOUT, async {
         loop {
             let message = mcp.read_next_message().await?;
             if let JSONRPCMessage::Notification(notification) = message {
-                if notification.method == "item/started" || notification.method == "item/completed"
-                {
-                    let params = notification.params.expect("item params");
-                    let item = if notification.method == "item/started" {
-                        let started: ItemStartedNotification =
-                            serde_json::from_value(params).expect("deserialize item/started");
-                        started.item
-                    } else {
-                        let completed: ItemCompletedNotification =
-                            serde_json::from_value(params).expect("deserialize item/completed");
-                        completed.item
-                    };
-                    if warning_text_from_item(&item).is_some_and(is_cyber_model_warning_text) {
-                        anyhow::bail!("expected cyber safety warning item to be suppressed");
+                match notification.method.as_str() {
+                    "warning" => {
+                        anyhow::bail!("expected cyber safety warning notification to be suppressed");
                     }
-                }
-                if notification.method == "turn/completed" {
-                    return Ok::<(), anyhow::Error>(());
+                    "turn/completed" => return Ok::<(), anyhow::Error>(()),
+                    _ => {}
                 }
             }
         }
@@ -303,6 +371,132 @@ async fn suppress_cyber_safety_warning_hides_warning_item_v2() -> Result<()> {
     .await??;
 
     Ok(())
+}
+
+async fn collect_turn_notifications_and_validate_no_warning_item(
+    mcp: &mut McpProcess,
+) -> Result<ModelReroutedNotification> {
+    let mut rerouted = None;
+
+    loop {
+        let message = timeout(DEFAULT_READ_TIMEOUT, mcp.read_next_message()).await??;
+        let JSONRPCMessage::Notification(notification) = message else {
+            continue;
+        };
+        match notification.method.as_str() {
+            "model/rerouted" => {
+                let params = notification.params.ok_or_else(|| {
+                    anyhow::anyhow!("model/rerouted notifications must include params")
+                })?;
+                let payload: ModelReroutedNotification = serde_json::from_value(params)?;
+                rerouted = Some(payload);
+            }
+            "item/started" => {
+                let params = notification.params.ok_or_else(|| {
+                    anyhow::anyhow!("item/started notifications must include params")
+                })?;
+                let payload: ItemStartedNotification = serde_json::from_value(params)?;
+                assert!(!is_warning_user_message_item(&payload.item));
+            }
+            "item/completed" => {
+                let params = notification.params.ok_or_else(|| {
+                    anyhow::anyhow!("item/completed notifications must include params")
+                })?;
+                let payload: ItemCompletedNotification = serde_json::from_value(params)?;
+                assert!(!is_warning_user_message_item(&payload.item));
+            }
+            "turn/completed" => {
+                return rerouted.ok_or_else(|| {
+                    anyhow::anyhow!("expected model/rerouted notification before turn/completed")
+                });
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn collect_model_verification_notifications_and_validate_no_warning_item(
+    mcp: &mut McpProcess,
+) -> Result<ModelVerificationNotification> {
+    let mut verification = None;
+
+    loop {
+        let message = timeout(DEFAULT_READ_TIMEOUT, mcp.read_next_message()).await??;
+        let JSONRPCMessage::Notification(notification) = message else {
+            continue;
+        };
+        match notification.method.as_str() {
+            "model/verification" => {
+                let params = notification.params.ok_or_else(|| {
+                    anyhow::anyhow!("model/verification notifications must include params")
+                })?;
+                let payload: ModelVerificationNotification = serde_json::from_value(params)?;
+                verification = Some(payload);
+            }
+            "warning" => {
+                anyhow::bail!("verification-only response must not emit warning");
+            }
+            "model/rerouted" => {
+                anyhow::bail!("verification-only response must not emit model/rerouted");
+            }
+            "item/started" => {
+                let params = notification.params.ok_or_else(|| {
+                    anyhow::anyhow!("item/started notifications must include params")
+                })?;
+                let payload: ItemStartedNotification = serde_json::from_value(params)?;
+                assert!(!is_warning_user_message_item(&payload.item));
+            }
+            "item/completed" => {
+                let params = notification.params.ok_or_else(|| {
+                    anyhow::anyhow!("item/completed notifications must include params")
+                })?;
+                let payload: ItemCompletedNotification = serde_json::from_value(params)?;
+                assert!(!is_warning_user_message_item(&payload.item));
+            }
+            "turn/completed" => {
+                let verification = verification.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "expected model/verification notification before turn/completed"
+                    )
+                })?;
+                return Ok(verification);
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn collect_cyber_policy_error_and_validate_no_reroute(
+    mcp: &mut McpProcess,
+) -> Result<ErrorNotification> {
+    let mut error = None;
+
+    loop {
+        let message = timeout(DEFAULT_READ_TIMEOUT, mcp.read_next_message()).await??;
+        let JSONRPCMessage::Notification(notification) = message else {
+            continue;
+        };
+        match notification.method.as_str() {
+            "error" => {
+                let params = notification
+                    .params
+                    .ok_or_else(|| anyhow::anyhow!("error notifications must include params"))?;
+                let payload: ErrorNotification = serde_json::from_value(params)?;
+                if payload.error.codex_error_info == Some(CodexErrorInfo::CyberPolicy) {
+                    error = Some(payload);
+                }
+            }
+            "model/rerouted" => {
+                anyhow::bail!("cyber policy response must not emit model/rerouted");
+            }
+            "turn/completed" => {
+                return error.ok_or_else(|| {
+                    anyhow::anyhow!("expected cyber policy error before turn/completed")
+                });
+            }
+            _ => {}
+        }
+    }
 }
 
 fn warning_text_from_item(item: &ThreadItem) -> Option<&str> {
@@ -316,9 +510,8 @@ fn warning_text_from_item(item: &ThreadItem) -> Option<&str> {
     })
 }
 
-fn is_cyber_model_warning_text(text: &str) -> bool {
-    text.contains("flagged for potentially high-risk cyber activity")
-        && text.contains("apply for trusted access: https://chatgpt.com/cyber")
+fn is_warning_user_message_item(item: &ThreadItem) -> bool {
+    warning_text_from_item(item).is_some()
 }
 
 fn create_config_toml(
