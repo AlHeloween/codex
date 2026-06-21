@@ -93,4 +93,9 @@ CHANGELOG.ignore.md
 # Python bytecode files
 __pycache__/
 *.pyc
+.opencode/
 .opencode/data
+
+# RAG index
+.adid_rag/
+.adid_rag/data

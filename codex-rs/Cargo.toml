@@ -485,6 +485,7 @@ ignored = [
 # Keep line tables/backtraces while avoiding expensive full variable debug info
 # across local dev builds.
 debug = "limited"
+codegen-units = 1
 
 [profile.dev-small]
 inherits = "dev"
@@ -514,9 +515,6 @@ strip = false
 debug = "limited"
 inherits = "test"
 opt-level = 0
-
-[profile.dev]
-codegen-units = 1
 
 [patch.crates-io]
 # Uncomment to debug local changes.
