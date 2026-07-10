@@ -292,7 +292,7 @@ async fn memories_startup_phase1_uses_live_thread_service_tier_and_detached_meta
     let config_snapshot =
         wait_for_service_tier(&test, Some(ServiceTier::Fast.request_value().to_string())).await?;
     assert_eq!(
-        config_snapshot.service_tier,
+        config_snapshot.service_tier.map(|t| t.request_value().to_string()),
         Some(ServiceTier::Fast.request_value().to_string())
     );
 
@@ -766,13 +766,13 @@ async fn wait_for_service_tier(
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let config_snapshot = test.codex.config_snapshot().await;
-        if config_snapshot.service_tier == expected_service_tier {
+        if config_snapshot.service_tier.map(|t| t.request_value().to_string()) == expected_service_tier {
             return Ok(config_snapshot);
         }
         anyhow::ensure!(
             Instant::now() < deadline,
             "timed out waiting for service_tier to become {expected_service_tier:?}, current={:?}",
-            config_snapshot.service_tier
+            config_snapshot.service_tier.map(|t| t.request_value().to_string())
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

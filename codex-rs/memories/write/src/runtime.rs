@@ -234,7 +234,7 @@ impl MemoryStartupContext {
             ),
             reasoning_effort: Some(reasoning_effort),
             reasoning_summary,
-            service_tier: config_snapshot.service_tier,
+            service_tier: config_snapshot.service_tier.map(|t| t.request_value().to_string()),
         }
     }
 

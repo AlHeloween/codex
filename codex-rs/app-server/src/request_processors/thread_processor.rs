@@ -45,12 +45,13 @@ fn collect_resume_override_mismatches(
             config_snapshot.model_provider_id
         ));
     }
+    let current_service_tier: Option<String> = config_snapshot.service_tier.clone().map(|t| t.request_value().to_string());
     if let Some(requested_service_tier) = request.service_tier.as_ref()
-        && requested_service_tier != &config_snapshot.service_tier
+        && Some(requested_service_tier.clone()) != current_service_tier
     {
         mismatch_details.push(format!(
             "service_tier requested={requested_service_tier:?} active={:?}",
-            config_snapshot.service_tier
+            current_service_tier
         ));
     }
     if let Some(requested_cwd) = request.cwd.as_deref() {
@@ -1329,7 +1330,7 @@ impl ThreadRequestProcessor {
             thread: thread.clone(),
             model: config_snapshot.model,
             model_provider: config_snapshot.model_provider_id,
-            service_tier: config_snapshot.service_tier,
+            service_tier: config_snapshot.service_tier.map(|t| t.request_value().to_string()),
             cwd,
             runtime_workspace_roots: config_snapshot.workspace_roots,
             instruction_sources,

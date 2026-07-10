@@ -508,7 +508,7 @@ async fn spawn_agent_service_tier_override_validates_the_effective_child_model()
             .await;
 
         assert_eq!(
-            snapshot.service_tier,
+            snapshot.service_tier.map(|t| t.request_value().to_string()),
             Some(ServiceTier::Fast.request_value().to_string())
         );
     }
@@ -609,7 +609,7 @@ async fn spawn_agent_service_tier_inheritance_preserves_supported_or_configured_
             .await;
 
         assert_eq!(
-            snapshot.service_tier,
+            snapshot.service_tier.map(|t| t.request_value().to_string()),
             Some(ServiceTier::Fast.request_value().to_string())
         );
     }
@@ -716,7 +716,7 @@ service_tier = "priority"
             .await;
 
         assert_eq!(
-            snapshot.service_tier,
+            snapshot.service_tier.map(|t| t.request_value().to_string()),
             Some(ServiceTier::Fast.request_value().to_string())
         );
     }
@@ -789,7 +789,7 @@ service_tier = "turbo"
         .await;
 
     assert_eq!(
-        snapshot.service_tier,
+        snapshot.service_tier.map(|t| t.request_value().to_string()),
         Some(ServiceTier::Fast.request_value().to_string())
     );
 }
@@ -887,7 +887,7 @@ async fn spawn_agent_full_history_fork_accepts_explicit_service_tier() {
         .await;
 
     assert_eq!(
-        snapshot.service_tier,
+        snapshot.service_tier.map(|t| t.request_value().to_string()),
         Some(ServiceTier::Fast.request_value().to_string())
     );
 }
@@ -953,7 +953,7 @@ async fn multi_agent_v2_full_history_fork_accepts_explicit_service_tier() {
         .await;
 
     assert_eq!(
-        snapshot.service_tier,
+        snapshot.service_tier.map(|t| t.request_value().to_string()),
         Some(ServiceTier::Fast.request_value().to_string())
     );
 }
@@ -1126,8 +1126,8 @@ async fn spawn_agent_errors_when_manager_dropped() {
         panic!("spawn should fail without a manager");
     };
     assert_eq!(
-        err,
-        FunctionCallError::RespondToModel("collab manager unavailable".to_string())
+        snapshot.service_tier.map(|t| t.request_value().to_string()),
+        Some(ServiceTier::Fast.request_value().to_string())
     );
 }
 

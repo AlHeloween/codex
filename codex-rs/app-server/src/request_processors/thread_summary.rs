@@ -199,7 +199,7 @@ pub(crate) fn thread_settings_from_config_snapshot(
         ),
         model: config_snapshot.model.clone(),
         model_provider: config_snapshot.model_provider_id.clone(),
-        service_tier: config_snapshot.service_tier.clone(),
+        service_tier: config_snapshot.service_tier.clone().map(|t| t.request_value().to_string()),
         effort: config_snapshot.reasoning_effort.clone(),
         summary: config_snapshot.reasoning_summary,
         collaboration_mode: config_snapshot.collaboration_mode.clone(),
