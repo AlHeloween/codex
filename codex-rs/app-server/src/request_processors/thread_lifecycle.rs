@@ -644,7 +644,7 @@ pub(super) async fn handle_pending_thread_resume_request(
         thread,
         model,
         model_provider: model_provider_id,
-        service_tier,
+        service_tier: service_tier.map(|t| t.request_value().to_string()),
         cwd,
         runtime_workspace_roots: workspace_roots,
         instruction_sources,

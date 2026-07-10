@@ -47,7 +47,7 @@ fn collect_resume_override_mismatches(
     }
     let current_service_tier: Option<String> = config_snapshot.service_tier.clone().map(|t| t.request_value().to_string());
     if let Some(requested_service_tier) = request.service_tier.as_ref()
-        && Some(requested_service_tier.clone()) != current_service_tier
+        && *requested_service_tier != current_service_tier
     {
         mismatch_details.push(format!(
             "service_tier requested={requested_service_tier:?} active={:?}",
