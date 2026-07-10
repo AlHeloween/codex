@@ -1,6 +1,7 @@
 use crate::acl::add_allow_ace;
 use crate::acl::add_deny_write_ace;
 use crate::acl::allow_null_device;
+use crate::acl::ensure_allow_write_aces;
 use crate::allow::AllowDenyPaths;
 use crate::allow::compute_allow_paths_for_permissions;
 use crate::cap::load_or_create_cap_sids;
@@ -32,6 +33,7 @@ use crate::workspace_acl::protect_workspace_codex_dir;
 use anyhow::Context;
 use anyhow::Result;
 use codex_protocol::models::PermissionProfile;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::path::Path;
@@ -80,17 +82,18 @@ pub(crate) struct LegacyAclSids<'a> {
 
 fn prepare_spawn_context_common(
     permission_profile: &PermissionProfile,
-    permission_profile_cwd: &Path,
+    workspace_roots: &[AbsolutePathBuf],
     codex_home: &Path,
     cwd: &Path,
     env_map: &mut HashMap<String, String>,
     command: &[String],
     options: SpawnPrepOptions,
 ) -> Result<SpawnContext> {
-    let permissions = ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_cwd(
-        permission_profile,
-        permission_profile_cwd,
-    )?;
+    let permissions =
+        ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
+            permission_profile,
+            workspace_roots,
+        )?;
 
     normalize_null_device_env(env_map);
     ensure_non_interactive_pager(env_map);
@@ -119,7 +122,7 @@ fn prepare_spawn_context_common(
 
 pub(crate) fn prepare_legacy_spawn_context(
     permission_profile: &PermissionProfile,
-    permission_profile_cwd: &Path,
+    workspace_roots: &[AbsolutePathBuf],
     codex_home: &Path,
     cwd: &Path,
     env_map: &mut HashMap<String, String>,
@@ -128,7 +131,7 @@ pub(crate) fn prepare_legacy_spawn_context(
 ) -> Result<SpawnContext> {
     let common = prepare_spawn_context_common(
         permission_profile,
-        permission_profile_cwd,
+        workspace_roots,
         codex_home,
         cwd,
         env_map,
@@ -292,7 +295,7 @@ pub(crate) fn apply_legacy_session_acl_rules(
                 let Some(root_sid) = matching_root_capability(p, acl_sids.write_root_sids) else {
                     continue;
                 };
-                let _ = add_allow_ace(p, root_sid.sid.as_ptr());
+                let _ = ensure_allow_write_aces(p, &[root_sid.sid.as_ptr()]);
             }
         }
         for p in &deny {
@@ -354,6 +357,8 @@ pub(crate) fn prepare_elevated_spawn_context_for_permissions(
     write_roots_override: Option<&[PathBuf]>,
     deny_read_paths_override: &[PathBuf],
     deny_write_paths_override: &[PathBuf],
+    proxy_enforced: bool,
+    proxy_settings_mode: crate::WindowsSandboxProxySettingsMode,
 ) -> Result<ElevatedSpawnContext> {
     normalize_null_device_env(env_map);
     ensure_non_interactive_pager(env_map);
@@ -408,7 +413,8 @@ pub(crate) fn prepare_elevated_spawn_context_for_permissions(
         } else {
             deny_write_paths_override
         },
-        /*proxy_enforced*/ false,
+        proxy_enforced,
+        proxy_settings_mode,
     )?;
     let caps = load_or_create_cap_sids(codex_home)?;
     let (psid_to_use, cap_sids) = if uses_write_capabilities {
@@ -472,10 +478,14 @@ mod tests {
         )
     }
 
+    fn workspace_roots_for(root: &Path) -> Vec<AbsolutePathBuf> {
+        vec![AbsolutePathBuf::from_absolute_path(root).expect("absolute workspace root")]
+    }
+
     fn should_apply_network_block(permission_profile: &PermissionProfile) -> bool {
-        ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_cwd(
+        ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
             permission_profile,
-            Path::new("."),
+            &[],
         )
         .expect("managed permission profile")
         .should_apply_network_block()
@@ -503,10 +513,11 @@ mod tests {
         let codex_home = TempDir::new().expect("tempdir");
         let cwd = TempDir::new().expect("tempdir");
         let mut env_map = HashMap::new();
+        let workspace_roots = workspace_roots_for(cwd.path());
 
         let _context = prepare_legacy_spawn_context(
             &PermissionProfile::workspace_write(),
-            cwd.path(),
+            workspace_roots.as_slice(),
             codex_home.path(),
             cwd.path(),
             &mut env_map,
@@ -533,10 +544,11 @@ mod tests {
             "HTTP_PROXY".to_string(),
             "http://user.proxy:8080".to_string(),
         )]);
+        let workspace_roots = workspace_roots_for(cwd.path());
 
         let context = prepare_spawn_context_common(
             &PermissionProfile::workspace_write(),
-            cwd.path(),
+            workspace_roots.as_slice(),
             codex_home.path(),
             cwd.path(),
             &mut env_map,
@@ -557,11 +569,11 @@ mod tests {
     }
 
     #[test]
-    fn legacy_session_capability_roots_use_profile_cwd_for_workspace_root() {
+    fn legacy_session_capability_roots_use_runtime_workspace_roots_for_workspace_root() {
         let tmp = TempDir::new().expect("tempdir");
         let codex_home = tmp.path().join("codex-home");
-        let permission_profile_cwd = tmp.path().join("workspace");
-        let command_cwd = permission_profile_cwd.join("subdir");
+        let workspace_root = tmp.path().join("workspace");
+        let command_cwd = workspace_root.join("subdir");
         std::fs::create_dir_all(&codex_home).expect("create codex home");
         std::fs::create_dir_all(&command_cwd).expect("create command cwd");
 
@@ -571,11 +583,13 @@ mod tests {
             /*exclude_tmpdir_env_var*/ true,
             /*exclude_slash_tmp*/ true,
         );
-        let permissions = ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_cwd(
-            &permission_profile,
-            &permission_profile_cwd,
-        )
-        .expect("managed permission profile");
+        let workspace_roots = workspace_roots_for(workspace_root.as_path());
+        let permissions =
+            ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
+                &permission_profile,
+                workspace_roots.as_slice(),
+            )
+            .expect("managed permission profile");
 
         let roots = legacy_session_capability_roots(
             &permissions,
@@ -586,7 +600,7 @@ mod tests {
 
         assert_eq!(
             roots,
-            vec![dunce::canonicalize(&permission_profile_cwd).expect("canonical profile cwd")]
+            vec![dunce::canonicalize(&workspace_root).expect("canonical workspace root")]
         );
     }
 
@@ -686,11 +700,13 @@ mod tests {
             /*exclude_tmpdir_env_var*/ true,
             /*exclude_slash_tmp*/ true,
         );
-        let permissions = ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_cwd(
-            &permission_profile,
-            &workspace,
-        )
-        .expect("managed permission profile");
+        let workspace_roots = workspace_roots_for(workspace.as_path());
+        let permissions =
+            ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
+                &permission_profile,
+                workspace_roots.as_slice(),
+            )
+            .expect("managed permission profile");
 
         let roots =
             legacy_session_capability_roots(&permissions, &workspace, &HashMap::new(), &codex_home);
