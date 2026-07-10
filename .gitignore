@@ -99,3 +99,6 @@ __pycache__/
 # RAG index
 .adid_rag/
 .adid_rag/data
+
+# Local-only config files
+adm.json
