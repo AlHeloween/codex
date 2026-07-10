@@ -291,6 +291,8 @@ fn new_config(model: Option<String>, arg0_paths: Arg0DispatchPaths) -> anyhow::R
         current_time_reminder: None,
         features: Default::default(),
         suppress_unstable_features_warning: false,
+        suppress_cyber_safety_warning: false,
+        active_profile: None,
         active_project: ProjectConfig { trust_level: None },
         notices: Notice::default(),
         check_for_update_on_startup: false,
