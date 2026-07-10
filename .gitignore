@@ -104,3 +104,5 @@ __pycache__/
 
 # Local-only config files
 adm.json
+_FOSSIL_
+.fossil-settings/ignore-glob
